@@ -1,0 +1,27 @@
+{
+  "name": "designs-crm-backend",
+  "version": "1.0.0",
+  "description": "Backend de Designs CRM con Node.js, Express y conector MySQL para WAMP/phpMyAdmin",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "crm",
+    "backend",
+    "mysql",
+    "wamp",
+    "express",
+    "nodejs"
+  ],
+  "author": "Pixel Perfect Agency",
+  "license": "ISC",
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "mysql2": "^3.22.5"
+  }
+}
