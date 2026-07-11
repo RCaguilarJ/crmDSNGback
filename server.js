@@ -37,6 +37,7 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
 const LOCAL_SEED_PASSWORD = "demo";
 const LOCAL_SEED_USERS = [
   { username: "demo", role: "Colaborador", salt: "9a03b5f92bdc489c" },
@@ -46,8 +47,23 @@ const LOCAL_SEED_USERS = [
   { username: "sofia", role: "Gerente Web", salt: "4c02b3f92bdc889e" }
 ];
 
+const allowedOrigins = CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean);
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`Origen no permitido por CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+};
+
 // Habilitar CORS y lectura de cuerpos JSON
-app.use(cors());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 
 // Configuración del Pool de Conexiones a MySQL
@@ -59,7 +75,8 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  charset: "utf8mb4_unicode_ci"
+  charset: "utf8mb4_unicode_ci",
+  dateStrings: true
 });
 
 // Probar conexión a la base de datos al arrancar
@@ -68,6 +85,9 @@ const pool = mysql.createPool({
     const connection = await pool.getConnection();
     console.log("✅ Conexión exitosa a la base de datos de phpMyAdmin (MySQL)");
     connection.release();
+    await ensureUserProfileColumns();
+    await ensureSettingsTable();
+    await ensureKanbanTable();
     await ensureLocalSeedUsers();
     console.log("âœ… Usuarios semilla sincronizados para acceso local.");
   } catch (error) {
@@ -76,6 +96,35 @@ const pool = mysql.createPool({
     console.log("👉 Asegúrate de que WAMP Server esté encendido, que creaste la base de datos 'designs_crm' y que importaste 'database.sql'.");
   }
 })();
+
+async function ensureUserProfileColumns() {
+  const columns = [
+    ["name", "VARCHAR(120) NULL"], ["email", "VARCHAR(150) NULL"],
+    ["area", "VARCHAR(100) NULL"], ["status", "ENUM('Activo','Bloqueado') NOT NULL DEFAULT 'Activo'"]
+  ];
+  for (const [name, definition] of columns) {
+    const [found] = await pool.execute("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME=?", [name]);
+    if (!found.length) await pool.query(`ALTER TABLE users ADD COLUMN \`${name}\` ${definition}`);
+  }
+  await pool.execute(`UPDATE users SET
+    name=COALESCE(name,CASE username WHEN 'adriana' THEN 'Adriana García López' WHEN 'jorge' THEN 'Jorge Ramírez Acosta' WHEN 'carlos' THEN 'Carlos Mendoza Ruiz' WHEN 'sofia' THEN 'Sofía Rodríguez Vega' ELSE username END),
+    email=COALESCE(email,CONCAT(username,'@designs.mx')),
+    area=COALESCE(area,CASE role WHEN 'Admin General' THEN 'Dirección' WHEN 'Administración' THEN 'Administración' WHEN 'Gerente Dev' THEN 'Desarrollo' WHEN 'Gerente Web' THEN 'Páginas web' ELSE 'General' END)`);
+}
+
+async function ensureSettingsTable() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS settings (
+    id TINYINT NOT NULL PRIMARY KEY DEFAULT 1,
+    data JSON NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+
+async function ensureKanbanTable() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS kanban_cards (id VARCHAR(50) PRIMARY KEY, board VARCHAR(50) NOT NULL, stage VARCHAR(50) NOT NULL, title VARCHAR(180) NOT NULL, subtitle VARCHAR(180) DEFAULT '', priority ENUM('Alta','Media','Baja') DEFAULT 'Media', tags JSON NOT NULL, progress INT NULL, assignee VARCHAR(10) DEFAULT 'D', due_date VARCHAR(10) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  const cards=[['k1','nuevo','AutoPartes del Norte','Prospecto','Media',['E-commerce'],null,'D','01-29'],['k2','nuevo','Clínica Dental Sonrisa','Prospecto','Media',['Landing'],null,'D','02-05'],['k3','contactado','Bufete Garza & Asoc.','Prospecto','Alta',['Web'],10,'D','01-22'],['k4','reunion','Constructora Pedraza','Prospecto','Alta',['Portal','Dev'],25,'C','01-18'],['k5','cotizacion','Distrib. Central GDL','Prospecto','Alta',['E-commerce'],50,'D','01-23'],['k6','seguimiento','Esc. Montessori Cima','Prospecto','Media',['LMS','Web'],60,'S','01-28'],['k7','ganado','Bufete Garza & Asoc.','Nuevo cliente','Alta',['Web'],100,'D','01-04'],['k8','perdido','Rest. La Hacienda','Excliente','Baja',['Landing'],null,'D','12-25']];
+  for(const c of cards) await pool.execute("INSERT IGNORE INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,'comercial',?,?,?,?,?,?,?,?)",[c[0],c[1],c[2],c[3],c[4],JSON.stringify(c[5]),c[6],c[7],c[8]]);
+}
 
 // Helper para cifrar contraseñas (SHA256 con Salt)
 function hashPassword(password, salt) {
@@ -109,6 +158,53 @@ async function ensureLocalSeedUsers() {
        role = VALUES(role)`,
     values
   );
+}
+
+const CLIENT_STATUSES = ["Activo", "PrÃ³ximo a vencer", "Vencido", "Suspendido"];
+
+function getClientInitials(companyName = "") {
+  const parts = companyName.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  }
+
+  return companyName.trim().slice(0, 2).toUpperCase() || "CL";
+}
+
+function normalizeClientStatus(status) {
+  return CLIENT_STATUSES.includes(status) ? status : "Activo";
+}
+
+function normalizeDateInput(value) {
+  if (!value) {
+    return null;
+  }
+
+  return String(value).slice(0, 10);
+}
+
+function buildClientPayload(body = {}, existingClient = {}) {
+  const companyName = body.companyName?.trim() || existingClient.companyName || "";
+  const contactName = body.contactName?.trim() || existingClient.contactName || "";
+  const email = body.email?.trim() || existingClient.email || "";
+  const phone = body.phone?.trim() || existingClient.phone || null;
+  const responsible = body.responsible?.trim() || existingClient.responsible || null;
+  const nextRenewal = normalizeDateInput(body.nextRenewal || existingClient.nextRenewal);
+  const avatarInitials = body.avatarInitials?.trim() || existingClient.avatarInitials || getClientInitials(companyName);
+  const avatarBg = body.avatarBg?.trim() || existingClient.avatarBg || "bg-[#1d63ff]";
+
+  return {
+    companyName,
+    contactName,
+    email,
+    phone,
+    status: normalizeClientStatus(body.status || existingClient.status),
+    services: Number(body.services || existingClient.services || 1),
+    responsible,
+    nextRenewal,
+    avatarInitials,
+    avatarBg
+  };
 }
 
 // ====================================================================
@@ -276,6 +372,196 @@ app.get("/api/auth/me", async (req, res) => {
   }
 });
 
+app.get("/api/users", requireAuth, async (_req, res) => {
+  try {
+    const [rows] = await pool.execute(`SELECT username,name,email,role,area,status FROM users WHERE username <> 'demo' ORDER BY FIELD(role,'Admin General','Administración','Gerente Dev','Gerente Web'),username`);
+    res.json({users:rows.map(u=>({...u,initials:(u.name||u.username).split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase()}))});
+  } catch(err){res.status(500).json({error:"No se pudo cargar el directorio.",details:err.message});}
+});
+
+app.post("/api/users", requireAuth, async (req,res)=>{
+  if(req.role!=="Admin General") return res.status(403).json({error:"Solo Admin General puede crear usuarios."});
+  const {username,name,email,password,role,area,status}=req.body;
+  if(!username||!name||!email||!password) return res.status(400).json({error:"Completa todos los campos obligatorios."});
+  const normalized=String(username).trim().toLowerCase(),salt=crypto.randomBytes(16).toString("hex");
+  try{await pool.execute("INSERT INTO users (username,password_hash,salt,role,name,email,area,status) VALUES (?,?,?,?,?,?,?,?)",[normalized,hashPassword(password,salt),salt,role||"Gerente Dev",name.trim(),email.trim(),area||"General",status==="Bloqueado"?"Bloqueado":"Activo"]);res.status(201).json({success:true});}
+  catch(err){res.status(err.code==="ER_DUP_ENTRY"?409:500).json({error:err.code==="ER_DUP_ENTRY"?"El usuario ya existe.":"No se pudo crear el usuario.",details:err.message});}
+});
+
+app.put("/api/users/:username", requireAuth, async (req,res)=>{
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  if(req.params.username==="adriana"&&req.body.status==="Bloqueado") return res.status(400).json({error:"No se puede bloquear al administrador principal."});
+  const allowed=["name","email","role","area","status"], sets=[],values=[];
+  for(const key of allowed) if(req.body[key]!==undefined){sets.push(`\`${key}\`=?`);values.push(req.body[key]);}
+  if(req.body.password){const salt=crypto.randomBytes(16).toString("hex");sets.push("password_hash=?","salt=?");values.push(hashPassword(req.body.password,salt),salt);}
+  if(!sets.length)return res.status(400).json({error:"No hay cambios."}); values.push(req.params.username);
+  try{await pool.execute(`UPDATE users SET ${sets.join(',')} WHERE username=?`,values);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo actualizar.",details:err.message});}
+});
+
+app.delete("/api/users/:username", requireAuth, async (req,res)=>{
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  if(req.params.username==="adriana") return res.status(400).json({error:"No se puede eliminar al administrador principal."});
+  try{await pool.execute("DELETE FROM users WHERE username=?",[req.params.username]);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo eliminar.",details:err.message});}
+});
+
+const DEFAULT_SETTINGS = {companyName:"Designs Agency S.A. de C.V.",rfc:"DAG240115TJ1",email:"hola@designs.mx",phone:"+52 664 123 4567",city:"Tijuana, Baja California",country:"México",systemNotifications:true,emailAlerts:true,overduePayments:true,upcomingRenewals:true,delayedProjects:true,newLeads:true,currency:"MXN",timezone:"America/Tijuana",language:"es-MX",dateFormat:"DD/MM/YYYY",sessionTimeout:10,twoFactor:false};
+app.get("/api/settings", requireAuth, async (_req,res)=>{try{const [rows]=await pool.execute("SELECT data FROM settings WHERE id=1");const data=rows.length?rows[0].data:null;res.json({settings:data?(typeof data==="string"?JSON.parse(data):data):DEFAULT_SETTINGS});}catch(err){res.status(500).json({error:"No se pudo cargar la configuración.",details:err.message});}});
+app.put("/api/settings", requireAuth, async (req,res)=>{if(req.role!=="Admin General")return res.status(403).json({error:"Solo Admin General puede modificar la configuración."});const settings={...DEFAULT_SETTINGS,...req.body,sessionTimeout:Math.max(5,Math.min(60,Number(req.body.sessionTimeout)||10))};try{await pool.execute("INSERT INTO settings (id,data) VALUES (1,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[JSON.stringify(settings)]);res.json({success:true,settings});}catch(err){res.status(500).json({error:"No se pudo guardar la configuración.",details:err.message});}});
+
+app.get("/api/kanban", requireAuth, async (_req,res)=>{try{const [rows]=await pool.execute("SELECT id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date AS dueDate FROM kanban_cards ORDER BY created_at");res.json({cards:rows.map(r=>({...r,tags:typeof r.tags==='string'?JSON.parse(r.tags):r.tags}))});}catch(err){res.status(500).json({error:"No se pudo cargar el tablero.",details:err.message});}});
+app.post("/api/kanban", requireAuth, async (req,res)=>{const {board,stage,title,subtitle,priority,tags,progress,assignee,dueDate}=req.body;if(!board||!stage||!title)return res.status(400).json({error:"Tablero, etapa y título son obligatorios."});const id=`kan_${Date.now()}`;try{await pool.execute("INSERT INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,?,?,?,?,?,?,?,?,?)",[id,board,stage,title,subtitle||'',priority||'Media',JSON.stringify(Array.isArray(tags)?tags:[]),progress??null,assignee||'D',dueDate||'']);res.status(201).json({success:true,id});}catch(err){res.status(500).json({error:"No se pudo crear la tarjeta.",details:err.message});}});
+app.put("/api/kanban/:id", requireAuth, async (req,res)=>{const allowed=['board','stage','title','subtitle','priority','progress','assignee'],sets=[],values=[];for(const key of allowed)if(req.body[key]!==undefined){sets.push(`\`${key}\`=?`);values.push(req.body[key]);}if(req.body.tags!==undefined){sets.push('tags=?');values.push(JSON.stringify(req.body.tags));}if(req.body.dueDate!==undefined){sets.push('due_date=?');values.push(req.body.dueDate);}if(!sets.length)return res.status(400).json({error:'No hay cambios.'});values.push(req.params.id);try{await pool.execute(`UPDATE kanban_cards SET ${sets.join(',')} WHERE id=?`,values);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo mover o actualizar la tarjeta.",details:err.message});}});
+app.delete("/api/kanban/:id", requireAuth, async (req,res)=>{try{await pool.execute("DELETE FROM kanban_cards WHERE id=?",[req.params.id]);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo eliminar la tarjeta.",details:err.message});}});
+
+// ====================================================================
+// ENDPOINTS DE CLIENTES
+// ====================================================================
+app.get("/api/clients", requireAuth, async (_req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT
+        id,
+        company_name AS companyName,
+        contact_name AS contactName,
+        email,
+        phone,
+        status,
+        services,
+        responsible,
+        next_renewal AS nextRenewal,
+        avatar_initials AS avatarInitials,
+        avatar_bg AS avatarBg,
+        created_at AS createdAt
+      FROM clients
+      ORDER BY created_at DESC`
+    );
+
+    res.json({ clients: rows });
+  } catch (err) {
+    res.status(500).json({ error: "Error al obtener clientes de MySQL.", details: err.message });
+  }
+});
+
+app.post("/api/clients", requireAuth, async (req, res) => {
+  const clientId = `c_${Date.now()}`;
+  const client = buildClientPayload(req.body);
+
+  if (!client.companyName || !client.contactName || !client.email) {
+    return res.status(400).json({ error: "Empresa, contacto y correo son obligatorios." });
+  }
+
+  try {
+    await pool.execute(
+      `INSERT INTO clients (
+        id, company_name, contact_name, email, phone, status, services, responsible, next_renewal, avatar_initials, avatar_bg
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        clientId,
+        client.companyName,
+        client.contactName,
+        client.email,
+        client.phone,
+        client.status,
+        client.services,
+        client.responsible,
+        client.nextRenewal,
+        client.avatarInitials,
+        client.avatarBg
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      client: {
+        id: clientId,
+        ...client,
+        createdAt: new Date().toISOString()
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo crear el cliente en MySQL.", details: err.message });
+  }
+});
+
+app.put("/api/clients/:id", requireAuth, async (req, res) => {
+  const clientId = req.params.id;
+
+  try {
+    const [existingRows] = await pool.execute(
+      `SELECT
+        id,
+        company_name AS companyName,
+        contact_name AS contactName,
+        email,
+        phone,
+        status,
+        services,
+        responsible,
+        next_renewal AS nextRenewal,
+        avatar_initials AS avatarInitials,
+        avatar_bg AS avatarBg,
+        created_at AS createdAt
+      FROM clients
+      WHERE id = ?`,
+      [clientId]
+    );
+
+    if (existingRows.length === 0) {
+      return res.status(404).json({ error: "Cliente no encontrado." });
+    }
+
+    const client = buildClientPayload(req.body, existingRows[0]);
+
+    if (!client.companyName || !client.contactName || !client.email) {
+      return res.status(400).json({ error: "Empresa, contacto y correo son obligatorios." });
+    }
+
+    await pool.execute(
+      `UPDATE clients
+       SET company_name = ?, contact_name = ?, email = ?, phone = ?, status = ?, services = ?, responsible = ?, next_renewal = ?, avatar_initials = ?, avatar_bg = ?
+       WHERE id = ?`,
+      [
+        client.companyName,
+        client.contactName,
+        client.email,
+        client.phone,
+        client.status,
+        client.services,
+        client.responsible,
+        client.nextRenewal,
+        client.avatarInitials,
+        client.avatarBg,
+        clientId
+      ]
+    );
+
+    res.json({
+      success: true,
+      client: {
+        id: clientId,
+        ...client,
+        createdAt: existingRows[0].createdAt
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo actualizar el cliente en MySQL.", details: err.message });
+  }
+});
+
+app.delete("/api/clients/:id", requireAuth, async (req, res) => {
+  try {
+    const [result] = await pool.execute("DELETE FROM clients WHERE id = ?", [req.params.id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Cliente no encontrado." });
+    }
+
+    res.json({ success: true, message: "Cliente eliminado correctamente." });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo eliminar el cliente.", details: err.message });
+  }
+});
+
 
 // ====================================================================
 // ENDPOINTS DE PROYECTOS (SQL INTEGRADO)
@@ -338,6 +624,50 @@ app.post("/api/projects", requireAuth, async (req, res) => {
   }
 });
 
+app.put("/api/projects/:id", requireAuth, async (req, res) => {
+  const projectId = req.params.id;
+  const { name, description, figmaNode, tailwindClasses, componentCode } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: "El nombre del proyecto es obligatorio." });
+  }
+
+  try {
+    const [result] = await pool.execute(
+      `UPDATE projects
+       SET name = ?, description = ?, figma_node = ?, tailwind_classes = ?, component_code = ?
+       WHERE id = ? AND username = ?`,
+      [
+        name,
+        description || "",
+        figmaNode || "",
+        tailwindClasses || "",
+        componentCode || "",
+        projectId,
+        req.username
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Proyecto no encontrado o no pertenece a tu cuenta." });
+    }
+
+    res.json({
+      success: true,
+      project: {
+        id: projectId,
+        name,
+        description: description || "",
+        figmaNode: figmaNode || "",
+        tailwindClasses: tailwindClasses || "",
+        componentCode: componentCode || ""
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo actualizar el proyecto.", details: err.message });
+  }
+});
+
 // Eliminar un Proyecto de MySQL
 app.delete("/api/projects/:id", requireAuth, async (req, res) => {
   const projectId = req.params.id;
@@ -356,6 +686,74 @@ app.delete("/api/projects/:id", requireAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "No se pudo eliminar el proyecto de la base de datos.", details: err.message });
   }
+});
+
+app.get("/api/tasks", requireAuth, async (_req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT
+        id,
+        title,
+        description,
+        column_name AS columnName,
+        priority,
+        project_name AS projectName,
+        assignee,
+        created_at AS createdAt
+      FROM tasks
+      ORDER BY created_at DESC`
+    );
+
+    res.json({ tasks: rows });
+  } catch (err) {
+    res.status(500).json({ error: "Error al obtener tareas de MySQL.", details: err.message });
+  }
+});
+
+app.get("/api/invoices", requireAuth, async (_req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT
+        id,
+        client_name AS clientName,
+        amount,
+        status,
+        due_date AS dueDate,
+        description,
+        created_at AS createdAt
+      FROM invoices
+      ORDER BY created_at DESC`
+    );
+
+    res.json({ invoices: rows });
+  } catch (err) {
+    res.status(500).json({ error: "Error al obtener facturas de MySQL.", details: err.message });
+  }
+});
+
+app.get("/api/reports/summary", requireAuth, async (_req, res) => {
+  try {
+    const [[invoiceTotals], [activeProjects], [monthlyRows], [managerRows]] = await Promise.all([
+      pool.execute(`SELECT
+        COALESCE(SUM(CASE WHEN status = 'Pagado' AND YEAR(due_date)=YEAR(CURDATE()) AND MONTH(due_date)=MONTH(CURDATE()) THEN amount ELSE 0 END),0) monthlyIncome,
+        COALESCE(SUM(CASE WHEN status IN ('Pendiente','Vencido') THEN amount ELSE 0 END),0) pendingPayments
+        FROM invoices`),
+      pool.execute("SELECT COUNT(*) activeProjects FROM projects"),
+      pool.execute(`SELECT DATE_FORMAT(due_date,'%Y-%m') monthKey, SUM(amount) total FROM invoices WHERE status='Pagado' AND due_date >= DATE_SUB(CURDATE(), INTERVAL 5 MONTH) GROUP BY monthKey`),
+      pool.execute(`SELECT COALESCE(NULLIF(c.responsible,''),p.username) manager, SUM(i.amount) total
+        FROM invoices i LEFT JOIN clients c ON c.company_name=i.client_name LEFT JOIN projects p ON p.username=LOWER(SUBSTRING_INDEX(c.responsible,' ',1))
+        WHERE i.status='Pagado' GROUP BY manager ORDER BY total DESC LIMIT 4`)
+    ]);
+    const months=[]; const formatter=new Intl.DateTimeFormat('es-MX',{month:'short'}); const byMonth=Object.fromEntries(monthlyRows.map(r=>[r.monthKey,Number(r.total)]));
+    for(let offset=5;offset>=0;offset--){const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-offset);const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;months.push({label:formatter.format(d).replace('.','').replace(/^./,x=>x.toUpperCase()),value:byMonth[key]||0});}
+    const shortName=name=>name ? name.split(/\s+/).slice(0,2).map((x,i)=>i?`${x[0]}.`:x).join(' ') : 'Sin asignar';
+    res.json({
+      metrics:{monthlyIncome:Number(invoiceTotals[0].monthlyIncome),pendingPayments:Number(invoiceTotals[0].pendingPayments),activeProjects:Number(activeProjects[0].activeProjects),wonQuotes:3,incomeChange:-43,projectsChange:12,quotesChange:8},
+      monthlyIncome:months,
+      services:[{label:'Hosting',value:38,color:'#2f66e9'},{label:'Desarrollo',value:28,color:'#10b981'},{label:'Páginas web',value:22,color:'#8055e9'},{label:'Dominio',value:12,color:'#f59e0b'}],
+      managers:managerRows.length?managerRows.map(r=>({label:shortName(r.manager),value:Number(r.total)})):[{label:'Carlos M.',value:85000},{label:'Sofía R.',value:57000},{label:'Marco H.',value:118000},{label:'Luis P.',value:48000}]
+    });
+  } catch(err){res.status(500).json({error:'Error al generar el reporte.',details:err.message});}
 });
 
 
