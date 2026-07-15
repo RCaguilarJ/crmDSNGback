@@ -23,7 +23,7 @@ USE `designs_crm`;
 -- --------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `users` (
   `username` VARCHAR(50) NOT NULL PRIMARY KEY,
-  `password_hash` VARCHAR(64) NOT NULL,
+  `password_hash` VARCHAR(255) NOT NULL,
   `salt` VARCHAR(32) NOT NULL,
   `role` VARCHAR(50) NOT NULL DEFAULT 'Colaborador',
   `name` VARCHAR(120) DEFAULT NULL,
@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS `users` (
   `area` VARCHAR(100) DEFAULT NULL,
   `status` ENUM('Activo','Bloqueado') NOT NULL DEFAULT 'Activo',
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Tokens de renovación para sesiones persistentes
+CREATE TABLE IF NOT EXISTS `refresh_tokens` (
+  `token_hash` VARCHAR(64) NOT NULL PRIMARY KEY,
+  `username` VARCHAR(50) NOT NULL,
+  `expires_at` DATETIME NOT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`username`) REFERENCES `users` (`username`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- --------------------------------------------------------------------
@@ -112,8 +121,9 @@ CREATE TABLE IF NOT EXISTS `kanban_cards` (
 -- SEED DE DATOS: CARGA INICIAL COMPATIBLE CON EL DEMO DEL COMPONENTE
 -- ====================================================================
 
--- 1. USUARIOS (Contraseña de fábrica de los usuarios es 'demo' encriptada con SHA256)
---    Cuentas: demo, adriana, jorge, carlos, sofia
+-- 1. USUARIOS
+--    Contraseña de fábrica de los usuarios heredados: 'demo' encriptada con SHA256 + salt.
+--    Los usuarios heredados se migran automáticamente a Argon2 al iniciar sesión o cambiar contraseña.
 INSERT INTO `users` (`username`, `password_hash`, `salt`, `role`) VALUES
 ('demo', 'd7a5c84907c293d9e2646d45059acfbb5ceee6d8d669342149adf1cd61971a73', '9a03b5f92bdc489c', 'Colaborador'),
 ('adriana', '9fbfc9d2b8e61c62b9779df52cd4599a24cda3a68404e47cb1b8b725728b3889', '8c05b2f92bdc234a', 'Admin General'),
@@ -150,5 +160,14 @@ INSERT INTO `invoices` (`id`, `client_name`, `amount`, `status`, `due_date`, `de
 ('inv_2', 'Nike México', 35000.00, 'Pendiente', '2026-07-28', 'Réplica interactiva del Bento Hero Section en React.'),
 ('inv_3', 'Netflix Inc', 15000.00, 'Vencido', '2026-06-30', 'Consultoría de branding y diseño de bento grids.')
 ON DUPLICATE KEY UPDATE `amount`=VALUES(`amount`);
+
+CREATE TABLE IF NOT EXISTS `module_data` (
+  `username` VARCHAR(50) NOT NULL,
+  `module_name` VARCHAR(40) NOT NULL,
+  `data` JSON NOT NULL,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`username`, `module_name`),
+  FOREIGN KEY (`username`) REFERENCES `users` (`username`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 COMMIT;

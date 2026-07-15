@@ -53,3 +53,8 @@ Puedes ingresar usando los siguientes usuarios de la agencia pixel-perfect para 
 - **Finanzas:** `jorge` (contraseña: `demo`)
 - **Desarrollo:** `carlos` (contraseña: `demo`)
 - **Diseño:** `sofia` (contraseña: `demo`)
+
+## 🔐 Seguridad de Contraseñas Actualizada
+- Las contraseñas nuevas y actualizadas se almacenan con `argon2id`.
+- Los usuarios heredados con SHA256+salt se migran automáticamente a Argon2 al iniciar sesión.
+- El refresh token se guarda en cookie `HttpOnly` y no se expone a JavaScript.

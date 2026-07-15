@@ -1,3 +1,4 @@
+
 /**
  * ====================================================================
  * BACKEND NODE.JS + EXPRESS CON CONECTOR MYSQL (WAMP STACK / PHPMYADMIN)
@@ -32,10 +33,26 @@ const express = require("express");
 const path = require("path");
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
+const argon2 = require("argon2");
 const cors = require("cors");
+const helmet = require("helmet");
+const { rateLimit } = require("express-rate-limit");
 require("dotenv").config();
+const jwt = require("jsonwebtoken");
+const cookieParser = require('cookie-parser');
+
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+if (IS_PRODUCTION && !process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET es obligatorio en producción.");
+}
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString("hex");
+if (!process.env.JWT_SECRET) {
+  console.warn("⚠️ JWT_SECRET no configurado: se usará una clave efímera solo para desarrollo.");
+}
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1h";
 
 const app = express();
+app.disable("x-powered-by");
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
 const LOCAL_SEED_PASSWORD = "demo";
@@ -49,7 +66,12 @@ const LOCAL_SEED_USERS = [
 
 const allowedOrigins = CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean);
 const corsOptions = {
-  origin(origin, callback) {
+  origin: function(origin, callback) {
+    // Permitir wildcard en desarrollo si se activa la variable de entorno
+    if (process.env.ALLOW_CORS_WILDCARD === "true") {
+      return callback(null, true);
+    }
+
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
@@ -64,7 +86,28 @@ const corsOptions = {
 // Habilitar CORS y lectura de cuerpos JSON
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(express.json());
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(cookieParser());
+app.use(express.json({ limit: "100kb" }));
+
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false, message: { error: "Demasiadas solicitudes. Intenta nuevamente más tarde." } });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: "draft-8", legacyHeaders: false, skipSuccessfulRequests: true, message: { error: "Demasiados intentos de autenticación. Intenta nuevamente en 15 minutos." } });
+const aiLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: "draft-8", legacyHeaders: false, message: { error: "Se alcanzó el límite temporal de solicitudes de IA." } });
+
+app.use("/api", apiLimiter);
+app.use(["/api/auth/login", "/api/auth/quick-login", "/api/auth/signup", "/api/auth/refresh"], authLimiter);
+
+app.use((req, res, next) => {
+  const sendJson = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode >= 500 && body && typeof body === "object") {
+      const { details, ...safeBody } = body;
+      return sendJson(safeBody);
+    }
+    return sendJson(body);
+  };
+  next();
+});
 
 // Configuración del Pool de Conexiones a MySQL
 const pool = mysql.createPool({
@@ -85,10 +128,15 @@ const pool = mysql.createPool({
     const connection = await pool.getConnection();
     console.log("✅ Conexión exitosa a la base de datos de phpMyAdmin (MySQL)");
     connection.release();
+    await ensureAuthSchema();
     await ensureUserProfileColumns();
+    await ensureWebProjectsTable();
     await ensureSettingsTable();
     await ensureKanbanTable();
-    await ensureLocalSeedUsers();
+    if (process.env.ENABLE_DEMO_SEED === "true") {
+      await ensureLocalSeedUsers();
+      console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
+    }
     console.log("âœ… Usuarios semilla sincronizados para acceso local.");
   } catch (error) {
     console.error("❌ Error conectando a la base de datos de WAMP (phpMyAdmin):");
@@ -96,6 +144,19 @@ const pool = mysql.createPool({
     console.log("👉 Asegúrate de que WAMP Server esté encendido, que creaste la base de datos 'designs_crm' y que importaste 'database.sql'.");
   }
 })();
+
+async function ensureAuthSchema() {
+  // Argon2 hashes are longer than the legacy 64-character SHA-256 hashes.
+  await pool.query("ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) NOT NULL");
+  await pool.execute(`CREATE TABLE IF NOT EXISTS refresh_tokens (
+    token_hash VARCHAR(64) NOT NULL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    expires_at DATETIME NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_refresh_tokens_user FOREIGN KEY (username)
+      REFERENCES users(username) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
 
 async function ensureUserProfileColumns() {
   const columns = [
@@ -112,6 +173,28 @@ async function ensureUserProfileColumns() {
     area=COALESCE(area,CASE role WHEN 'Admin General' THEN 'Dirección' WHEN 'Administración' THEN 'Administración' WHEN 'Gerente Dev' THEN 'Desarrollo' WHEN 'Gerente Web' THEN 'Páginas web' ELSE 'General' END)`);
 }
 
+async function ensureWebProjectsTable() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS web_projects (
+    id VARCHAR(50) NOT NULL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    name VARCHAR(150) NOT NULL,
+    client_name VARCHAR(150) NOT NULL,
+    manager VARCHAR(100) NOT NULL DEFAULT '',
+    designer VARCHAR(100) NOT NULL DEFAULT '',
+    builder VARCHAR(100) NOT NULL DEFAULT '',
+    start_date DATE NULL,
+    due_date DATE NULL,
+    progress INT NOT NULL DEFAULT 0,
+    status VARCHAR(50) NOT NULL DEFAULT 'Diseño inicial',
+    priority VARCHAR(20) NOT NULL DEFAULT 'Media',
+    description TEXT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_web_projects_user FOREIGN KEY (username)
+      REFERENCES users(username) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+
 async function ensureSettingsTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS settings (
     id TINYINT NOT NULL PRIMARY KEY DEFAULT 1,
@@ -126,18 +209,43 @@ async function ensureKanbanTable() {
   for(const c of cards) await pool.execute("INSERT IGNORE INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,'comercial',?,?,?,?,?,?,?,?)",[c[0],c[1],c[2],c[3],c[4],JSON.stringify(c[5]),c[6],c[7],c[8]]);
 }
 
-// Helper para cifrar contraseñas (SHA256 con Salt)
-function hashPassword(password, salt) {
+// Legacy helper para SHA256 con salt usado por los datos semilla heredados
+function legacyHashPassword(password, salt) {
   return crypto
     .createHash("sha256")
     .update(password + salt)
     .digest("hex");
 }
 
+async function hashPassword(password) {
+  return argon2.hash(password, {
+    type: argon2.argon2id,
+    memoryCost: 2 ** 16,
+    timeCost: 3,
+    parallelism: 1
+  });
+}
+
+async function verifyPassword(password, storedHash, salt) {
+  if (typeof storedHash !== "string") {
+    return false;
+  }
+
+  if (storedHash.startsWith("$argon2")) {
+    return argon2.verify(storedHash, password);
+  }
+
+  if (salt) {
+    return legacyHashPassword(password, salt) === storedHash;
+  }
+
+  return false;
+}
+
 async function ensureLocalSeedUsers() {
   const seedUsers = LOCAL_SEED_USERS.map(({ username, role, salt }) => ({
     username,
-    passwordHash: hashPassword(LOCAL_SEED_PASSWORD, salt),
+    passwordHash: legacyHashPassword(LOCAL_SEED_PASSWORD, salt),
     salt,
     role
   }));
@@ -151,13 +259,24 @@ async function ensureLocalSeedUsers() {
   ]);
 
   await pool.execute(
-    `INSERT INTO users (username, password_hash, salt, role) VALUES ${placeholders}
-     ON DUPLICATE KEY UPDATE
-       password_hash = VALUES(password_hash),
-       salt = VALUES(salt),
-       role = VALUES(role)`,
+    `INSERT IGNORE INTO users (username, password_hash, salt, role) VALUES ${placeholders}`,
     values
   );
+}
+
+// Helper: Crear y guardar refresh token en BD (dev: 30 días)
+async function createRefreshToken(username, daysValid = 30) {
+  const token = crypto.randomBytes(64).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const expiresAt = new Date(Date.now() + daysValid * 24 * 60 * 60 * 1000);
+  await pool.execute("INSERT INTO refresh_tokens (token_hash, username, expires_at) VALUES (?, ?, ?)", [tokenHash, username, expiresAt.toISOString().slice(0,19).replace('T',' ')]);
+  return token;
+}
+
+// Helper: revoke refresh token
+async function revokeRefreshToken(token) {
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await pool.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", [tokenHash]);
 }
 
 const CLIENT_STATUSES = ["Activo", "PrÃ³ximo a vencer", "Vencido", "Suspendido"];
@@ -216,25 +335,66 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "No autorizado. Token faltante." });
   }
 
-  // En el entorno local simplificado, el token Bearer representa el 'username'
   const token = authHeader.substring(7);
-  
   try {
-    const [rows] = await pool.execute(
-      "SELECT username, role FROM users WHERE username = ?", 
-      [token]
+    const payload = jwt.verify(token, JWT_SECRET);
+    const [users] = await pool.execute(
+      "SELECT username, role, status FROM users WHERE username = ? LIMIT 1",
+      [payload.username]
     );
-
-    if (rows.length === 0) {
-      return res.status(401).json({ error: "Sesión inválida o expirada." });
+    if (!users.length || users[0].status !== "Activo") {
+      return res.status(401).json({ error: "Sesión inválida o cuenta bloqueada." });
     }
-
-    req.username = rows[0].username;
-    req.role = rows[0].role;
+    req.username = users[0].username;
+    req.role = users[0].role;
     next();
   } catch (err) {
-    res.status(500).json({ error: "Error de validación de sesión.", details: err.message });
+    return res.status(401).json({ error: "Sesión inválida o expirada." });
   }
+}
+
+const ROLE_KEY_BY_NAME = {
+  admin_general: "admin_general",
+  "Admin General": "admin_general",
+  administracion: "administracion",
+  "Administración": "administracion",
+  gerente_dev: "gerente_dev",
+  "Gerente Dev": "gerente_dev",
+  gerente_web: "gerente_web",
+  "Gerente Web": "gerente_web"
+};
+
+const PERMISSIONS = {
+  clients: ["admin_general", "administracion", "gerente_dev", "gerente_web"],
+  leads: ["admin_general", "administracion"],
+  services: ["admin_general", "administracion"],
+  billing: ["admin_general", "administracion"],
+  renewals: ["admin_general", "administracion"],
+  quotes: ["admin_general", "administracion", "gerente_dev", "gerente_web"],
+  projects: ["admin_general", "administracion", "gerente_dev"],
+  projects_web: ["admin_general", "gerente_web"],
+  kanban: ["admin_general", "administracion", "gerente_dev", "gerente_web"],
+  tasks: ["admin_general", "administracion", "gerente_dev", "gerente_web"],
+  staff: ["admin_general", "gerente_dev", "gerente_web"],
+  credentials: ["admin_general"],
+  reports: ["admin_general", "administracion"],
+  users: ["admin_general"],
+  settings: ["admin_general"]
+};
+
+function requirePermission(permission) {
+  return (req, res, next) => {
+    const roleKey = ROLE_KEY_BY_NAME[req.role];
+    if (!roleKey || !PERMISSIONS[permission]?.includes(roleKey)) {
+      return res.status(403).json({ error: "No tienes permiso para acceder a este recurso." });
+    }
+    next();
+  };
+}
+
+function requireModulePermission(req, res, next) {
+  if (!PERMISSIONS[req.params.module]) return next();
+  return requirePermission(req.params.module)(req, res, next);
 }
 
 // ====================================================================
@@ -244,8 +404,11 @@ async function requireAuth(req, res, next) {
 // Registro de Usuario Nuevo
 app.post("/api/auth/signup", async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: "Faltan credenciales" });
+  if (typeof username !== "string" || !/^[a-zA-Z0-9._-]{3,50}$/.test(username.trim())) {
+    return res.status(400).json({ error: "El usuario debe tener entre 3 y 50 caracteres válidos." });
+  }
+  if (typeof password !== "string" || password.length < 12 || password.length > 128) {
+    return res.status(400).json({ error: "La contraseña debe tener entre 12 y 128 caracteres." });
   }
 
   const normalizedUser = username.trim().toLowerCase();
@@ -261,15 +424,26 @@ app.post("/api/auth/signup", async (req, res) => {
       return res.status(400).json({ error: "El usuario ya existe en la base de datos." });
     }
 
-    const salt = crypto.randomBytes(16).toString("hex");
-    const passwordHash = hashPassword(password, salt);
+    const passwordHash = await hashPassword(password);
     const defaultRole = normalizedUser === "adriana" ? "Admin General" : "Colaborador";
 
     // Insertar en MySQL
     await pool.execute(
       "INSERT INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)",
-      [normalizedUser, passwordHash, salt, defaultRole]
+      [normalizedUser, passwordHash, "", defaultRole]
     );
+
+    // Generar JWT y refresh token
+    const accessToken = jwt.sign({ username: normalizedUser, role: defaultRole }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const refreshToken = await createRefreshToken(normalizedUser, 30);
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 30 * 24 * 60 * 60 * 1000
+    };
+    res.cookie('refreshToken', refreshToken, cookieOptions);
 
     res.json({
       success: true,
@@ -278,7 +452,7 @@ app.post("/api/auth/signup", async (req, res) => {
         projectsCount: 0,
         role: defaultRole
       },
-      sessionId: normalizedUser // En local usamos el mismo username como token simplificado
+      sessionId: accessToken
     });
   } catch (err) {
     console.error("Error en registro:", err);
@@ -287,6 +461,49 @@ app.post("/api/auth/signup", async (req, res) => {
 });
 
 // Inicio de Sesión
+app.post("/api/auth/quick-login", async (req, res) => {
+  if (IS_PRODUCTION) return res.status(404).json({ error: "Recurso no encontrado." });
+
+  const allowedUsers = new Set(["adriana", "jorge", "carlos", "sofia"]);
+  const normalizedUser = typeof req.body.username === "string" ? req.body.username.trim().toLowerCase() : "";
+  if (!allowedUsers.has(normalizedUser)) {
+    return res.status(400).json({ error: "Usuario de acceso rápido no válido." });
+  }
+
+  try {
+    const [users] = await pool.execute(
+      "SELECT username, role, status FROM users WHERE username = ? LIMIT 1",
+      [normalizedUser]
+    );
+    if (!users.length || users[0].status !== "Activo") {
+      return res.status(401).json({ error: "Acceso rápido no disponible." });
+    }
+
+    const dbUser = users[0];
+    const [[projectCount]] = await pool.execute(
+      "SELECT COUNT(*) AS count FROM projects WHERE username = ?",
+      [dbUser.username]
+    );
+    const accessToken = jwt.sign({ username: dbUser.username, role: dbUser.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const refreshToken = await createRefreshToken(dbUser.username, 30);
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: IS_PRODUCTION,
+      sameSite: "strict",
+      path: "/",
+      maxAge: 30 * 24 * 60 * 60 * 1000
+    });
+    return res.json({
+      success: true,
+      user: { username: dbUser.username, projectsCount: projectCount.count, role: dbUser.role },
+      sessionId: accessToken
+    });
+  } catch (err) {
+    console.error("Error en acceso rápido:", err);
+    return res.status(500).json({ error: "Error interno al iniciar sesión." });
+  }
+});
+
 app.post("/api/auth/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -297,7 +514,7 @@ app.post("/api/auth/login", async (req, res) => {
 
   try {
     const [users] = await pool.execute(
-      "SELECT username, password_hash, salt, role FROM users WHERE username = ?",
+      "SELECT username, password_hash, salt, role, status FROM users WHERE username = ?",
       [normalizedUser]
     );
 
@@ -306,10 +523,20 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const dbUser = users[0];
-    const checkHash = hashPassword(password, dbUser.salt);
-
-    if (checkHash !== dbUser.password_hash) {
+    if (dbUser.status !== "Activo") {
       return res.status(401).json({ error: "Usuario o contraseña incorrectos." });
+    }
+    const validPassword = await verifyPassword(password, dbUser.password_hash, dbUser.salt);
+    if (!validPassword) {
+      return res.status(401).json({ error: "Usuario o contraseña incorrectos." });
+    }
+
+    if (!dbUser.password_hash.startsWith("$argon2")) {
+      const upgradedHash = await hashPassword(password);
+      await pool.execute(
+        "UPDATE users SET password_hash = ?, salt = ? WHERE username = ?",
+        [upgradedHash, "", dbUser.username]
+      );
     }
 
     // Contar proyectos creados por el usuario
@@ -319,6 +546,19 @@ app.post("/api/auth/login", async (req, res) => {
     );
     const projectsCount = projectCountRows[0].count;
 
+    const accessToken = jwt.sign({ username: dbUser.username, role: dbUser.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const refreshToken = await createRefreshToken(dbUser.username, 30);
+
+    // Set refresh token in HttpOnly cookie
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 30 * 24 * 60 * 60 * 1000
+    };
+    res.cookie('refreshToken', refreshToken, cookieOptions);
+
     res.json({
       success: true,
       user: {
@@ -326,7 +566,7 @@ app.post("/api/auth/login", async (req, res) => {
         projectsCount,
         role: dbUser.role
       },
-      sessionId: dbUser.username // Token simplificado para agilizar el desarrollo local
+      sessionId: accessToken
     });
   } catch (err) {
     console.error("Error en login:", err);
@@ -342,14 +582,16 @@ app.get("/api/auth/me", async (req, res) => {
   }
 
   const token = authHeader.substring(7);
-
   try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const username = payload.username;
+
     const [users] = await pool.execute(
-      "SELECT username, role FROM users WHERE username = ?",
-      [token]
+      "SELECT username, role, status FROM users WHERE username = ?",
+      [username]
     );
 
-    if (users.length === 0) {
+    if (users.length === 0 || users[0].status !== "Activo") {
       return res.json({ user: null });
     }
 
@@ -372,6 +614,86 @@ app.get("/api/auth/me", async (req, res) => {
   }
 });
 
+// Refresh token endpoint - exchange refresh token for new access token (and rotate refresh token)
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const cookieToken = req.cookies?.refreshToken;
+    if (!cookieToken) return res.status(400).json({ error: 'Refresh token cookie requerido.' });
+
+    const tokenHash = crypto.createHash('sha256').update(cookieToken).digest('hex');
+    const [rows] = await pool.execute(
+      `SELECT rt.username, rt.expires_at, u.role, u.status
+       FROM refresh_tokens rt
+       INNER JOIN users u ON u.username = rt.username
+       WHERE rt.token_hash = ?`,
+      [tokenHash]
+    );
+    if (rows.length === 0) {
+      // Possible reuse/invalid token
+      return res.status(401).json({ error: 'Refresh token inválido.' });
+    }
+
+    const row = rows[0];
+    if (row.status !== "Activo") {
+      await revokeRefreshToken(cookieToken);
+      res.clearCookie("refreshToken", { path: "/" });
+      return res.status(401).json({ error: "Cuenta bloqueada." });
+    }
+    const expiresAt = new Date(row.expires_at);
+    if (expiresAt < new Date()) {
+      // token expirado
+      await revokeRefreshToken(cookieToken);
+      res.clearCookie('refreshToken', { path: '/' });
+      return res.status(401).json({ error: 'Refresh token expirado.' });
+    }
+
+    // Rotate: revoke old and issue new
+    await revokeRefreshToken(cookieToken);
+    const newRefreshToken = await createRefreshToken(row.username, 30);
+
+    // Set new cookie
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 30 * 24 * 60 * 60 * 1000
+    };
+    res.cookie('refreshToken', newRefreshToken, cookieOptions);
+
+    const accessToken = jwt.sign({ username: row.username, role: row.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    res.json({ sessionId: accessToken });
+  } catch (err) {
+    res.status(500).json({ error: 'Error procesando refresh token.', details: err.message });
+  }
+});
+
+// Logout: revoke a refresh token
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const cookieToken = req.cookies?.refreshToken;
+    if (!cookieToken) return res.status(400).json({ error: 'Refresh token cookie requerido.' });
+    await revokeRefreshToken(cookieToken);
+    res.clearCookie('refreshToken', { path: '/' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'No se pudo cerrar la sesión.', details: err.message });
+  }
+});
+
+// Module-level authorization. Route handlers keep their existing authentication
+// middleware so the current auth flow remains unchanged.
+app.use("/api/users", requireAuth, requirePermission("users"));
+app.use("/api/settings", requireAuth, requirePermission("settings"));
+app.use("/api/kanban", requireAuth, requirePermission("kanban"));
+app.use("/api/clients", requireAuth, requirePermission("clients"));
+app.use("/api/projects", requireAuth, requirePermission("projects"));
+app.use("/api/web-projects", requireAuth, requirePermission("projects_web"));
+app.use("/api/tasks", requireAuth, requirePermission("tasks"));
+app.use("/api/invoices", requireAuth, requirePermission("billing"));
+app.use("/api/module-data/:module", requireAuth, requireModulePermission);
+app.use("/api/reports", requireAuth, requirePermission("reports"));
+
 app.get("/api/users", requireAuth, async (_req, res) => {
   try {
     const [rows] = await pool.execute(`SELECT username,name,email,role,area,status FROM users WHERE username <> 'demo' ORDER BY FIELD(role,'Admin General','Administración','Gerente Dev','Gerente Web'),username`);
@@ -383,9 +705,15 @@ app.post("/api/users", requireAuth, async (req,res)=>{
   if(req.role!=="Admin General") return res.status(403).json({error:"Solo Admin General puede crear usuarios."});
   const {username,name,email,password,role,area,status}=req.body;
   if(!username||!name||!email||!password) return res.status(400).json({error:"Completa todos los campos obligatorios."});
-  const normalized=String(username).trim().toLowerCase(),salt=crypto.randomBytes(16).toString("hex");
-  try{await pool.execute("INSERT INTO users (username,password_hash,salt,role,name,email,area,status) VALUES (?,?,?,?,?,?,?,?)",[normalized,hashPassword(password,salt),salt,role||"Gerente Dev",name.trim(),email.trim(),area||"General",status==="Bloqueado"?"Bloqueado":"Activo"]);res.status(201).json({success:true});}
-  catch(err){res.status(err.code==="ER_DUP_ENTRY"?409:500).json({error:err.code==="ER_DUP_ENTRY"?"El usuario ya existe.":"No se pudo crear el usuario.",details:err.message});}
+  if(typeof password!=="string"||password.length<12||password.length>128)return res.status(400).json({error:"La contraseña debe tener entre 12 y 128 caracteres."});
+  const normalized=String(username).trim().toLowerCase();
+  try {
+    const passwordHash = await hashPassword(password);
+    await pool.execute("INSERT INTO users (username,password_hash,salt,role,name,email,area,status) VALUES (?,?,?,?,?,?,?,?)",[normalized,passwordHash,"",role||"Gerente Dev",name.trim(),email.trim(),area||"General",status==="Bloqueado"?"Bloqueado":"Activo"]);
+    res.status(201).json({success:true});
+  } catch(err) {
+    res.status(err.code==="ER_DUP_ENTRY"?409:500).json({error:err.code==="ER_DUP_ENTRY"?"El usuario ya existe.":"No se pudo crear el usuario.",details:err.message});
+  }
 });
 
 app.put("/api/users/:username", requireAuth, async (req,res)=>{
@@ -393,7 +721,12 @@ app.put("/api/users/:username", requireAuth, async (req,res)=>{
   if(req.params.username==="adriana"&&req.body.status==="Bloqueado") return res.status(400).json({error:"No se puede bloquear al administrador principal."});
   const allowed=["name","email","role","area","status"], sets=[],values=[];
   for(const key of allowed) if(req.body[key]!==undefined){sets.push(`\`${key}\`=?`);values.push(req.body[key]);}
-  if(req.body.password){const salt=crypto.randomBytes(16).toString("hex");sets.push("password_hash=?","salt=?");values.push(hashPassword(req.body.password,salt),salt);}
+  if(req.body.password){
+    if(typeof req.body.password!=="string"||req.body.password.length<12||req.body.password.length>128)return res.status(400).json({error:"La contraseña debe tener entre 12 y 128 caracteres."});
+    const passwordHash = await hashPassword(req.body.password);
+    sets.push("password_hash=?","salt=?");
+    values.push(passwordHash,"");
+  }
   if(!sets.length)return res.status(400).json({error:"No hay cambios."}); values.push(req.params.username);
   try{await pool.execute(`UPDATE users SET ${sets.join(',')} WHERE username=?`,values);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo actualizar.",details:err.message});}
 });
@@ -668,6 +1001,32 @@ app.put("/api/projects/:id", requireAuth, async (req, res) => {
   }
 });
 
+// Soporte PATCH para ediciones parciales desde el frontend (compatibilidad)
+app.patch("/api/projects/:id", requireAuth, async (req, res) => {
+  const projectId = req.params.id;
+  const allowed = ["name", "description", "figma_node", "tailwind_classes", "component_code"];
+  const sets = [];
+  const values = [];
+
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      sets.push(`\`${key.replace(/\w+/g, (m) => m)}\` = ?`);
+      values.push(req.body[key]);
+    }
+  }
+
+  if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
+  values.push(projectId, req.username);
+
+  try {
+    const [result] = await pool.execute(`UPDATE projects SET ${sets.join(", ")} WHERE id = ? AND username = ?`, values);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Proyecto no encontrado o no pertenece a tu cuenta." });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo actualizar el proyecto.", details: err.message });
+  }
+});
+
 // Eliminar un Proyecto de MySQL
 app.delete("/api/projects/:id", requireAuth, async (req, res) => {
   const projectId = req.params.id;
@@ -685,6 +1044,112 @@ app.delete("/api/projects/:id", requireAuth, async (req, res) => {
     res.json({ success: true, message: "Proyecto eliminado correctamente de phpMyAdmin." });
   } catch (err) {
     res.status(500).json({ error: "No se pudo eliminar el proyecto de la base de datos.", details: err.message });
+  }
+});
+
+// ====================================================================
+// ENDPOINTS PARA WEB_PROJECTS (CRUD completo)
+// ====================================================================
+app.get("/api/web-projects", requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT id, name, client_name AS clientName, manager, designer, builder, start_date AS startDate, due_date AS dueDate, progress, status, priority, description, created_at AS createdAt, updated_at AS updatedAt FROM web_projects WHERE username = ? ORDER BY created_at DESC`,
+      [req.username]
+    );
+    res.json({ projects: rows });
+  } catch (err) {
+    res.status(500).json({ error: "Error al obtener web projects.", details: err.message });
+  }
+});
+
+app.post("/api/web-projects", requireAuth, async (req, res) => {
+  const { name, clientName, manager, designer, builder, startDate, dueDate, progress, status, priority, description } = req.body;
+  if (!name || !clientName) return res.status(400).json({ error: "Nombre y cliente son obligatorios." });
+
+  const id = `wp_${Date.now()}`;
+  try {
+    await pool.execute(
+      `INSERT INTO web_projects (id, username, name, client_name, manager, designer, builder, start_date, due_date, progress, status, priority, description) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, req.username, name, clientName, manager || '', designer || '', builder || '', startDate || null, dueDate || null, progress ?? 0, status || 'Diseño inicial', priority || 'Media', description || '']
+    );
+
+    res.status(201).json({ success: true, project: { id, name, clientName, manager, designer, builder, startDate, dueDate, progress, status, priority, description, createdAt: new Date().toISOString() } });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo crear el web project.", details: err.message });
+  }
+});
+
+app.put("/api/web-projects/:id", requireAuth, async (req, res) => {
+  const projectId = req.params.id;
+  const allowed = ["name", "client_name", "manager", "designer", "builder", "start_date", "due_date", "progress", "status", "priority", "description"];
+  const sets = [];
+  const values = [];
+
+  for (const key of allowed) {
+    if (req.body[key]
+       !== undefined) {
+      sets.push(`\`${key}\` = ?`);
+      values.push(req.body[key]);
+    }
+  }
+
+  if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
+  values.push(projectId, req.username);
+
+  try {
+    const [result] = await pool.execute(`UPDATE web_projects SET ${sets.join(', ')} WHERE id = ? AND username = ?`, values);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Web project no encontrado o no pertenece a tu cuenta." });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo actualizar el web project.", details: err.message });
+  }
+});
+
+app.patch("/api/web-projects/:id", requireAuth, async (req, res) => {
+  // Reutiliza la lógica de PUT pero permite cambios parciales
+  const projectId = req.params.id;
+  const mapFields = {
+    name: 'name',
+    clientName: 'client_name',
+    manager: 'manager',
+    designer: 'designer',
+    builder: 'builder',
+    startDate: 'start_date',
+    dueDate: 'due_date',
+    progress: 'progress',
+    status: 'status',
+    priority: 'priority',
+    description: 'description'
+  };
+  const sets = [];
+  const values = [];
+
+  for (const key of Object.keys(mapFields)) {
+    if (req.body[key] !== undefined) {
+      sets.push(`\`${mapFields[key]}\` = ?`);
+      values.push(req.body[key]);
+    }
+  }
+
+  if (!sets.length) return res.status(400).json({ error: 'No hay cambios.' });
+  values.push(projectId, req.username);
+
+  try {
+    const [result] = await pool.execute(`UPDATE web_projects SET ${sets.join(', ')} WHERE id = ? AND username = ?`, values);
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Web project no encontrado o no pertenece a tu cuenta.' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'No se pudo actualizar el web project.', details: err.message });
+  }
+});
+
+app.delete("/api/web-projects/:id", requireAuth, async (req, res) => {
+  try {
+    const [result] = await pool.execute("DELETE FROM web_projects WHERE id = ? AND username = ?", [req.params.id, req.username]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Web project no encontrado o no pertenece a tu cuenta." });
+    res.json({ success: true, message: "Web project eliminado correctamente." });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo eliminar el web project.", details: err.message });
   }
 });
 
@@ -710,6 +1175,31 @@ app.get("/api/tasks", requireAuth, async (_req, res) => {
   }
 });
 
+app.post("/api/tasks", requireAuth, async (req, res) => {
+  const { title, description = "", column = "Backlog", priority = "Media", projectName = null, assignee = null } = req.body;
+  if (!title?.trim()) return res.status(400).json({ error: "El título es obligatorio." });
+  const id = `t_${Date.now()}`;
+  try {
+    await pool.execute("INSERT INTO tasks (id,title,description,column_name,priority,project_name,assignee) VALUES (?,?,?,?,?,?,?)", [id,title.trim(),description,column,priority,projectName,assignee]);
+    res.status(201).json({ success: true, task: { id,title:title.trim(),description,column,columnName:column,priority,projectName,assignee } });
+  } catch (err) { res.status(500).json({ error: "No se pudo crear la tarea.", details: err.message }); }
+});
+
+app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
+  const map = { title:"title", description:"description", column:"column_name", priority:"priority", projectName:"project_name", assignee:"assignee" };
+  const sets=[], values=[];
+  for (const [key,column] of Object.entries(map)) if (req.body[key] !== undefined) { sets.push(`\`${column}\`=?`); values.push(req.body[key]); }
+  if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
+  values.push(req.params.id);
+  try { const [result]=await pool.execute(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`,values); if(!result.affectedRows)return res.status(404).json({error:"Tarea no encontrada."}); res.json({success:true}); }
+  catch(err){res.status(500).json({error:"No se pudo actualizar la tarea.",details:err.message});}
+});
+
+app.delete("/api/tasks/:id", requireAuth, async (req,res) => {
+  try { const [result]=await pool.execute("DELETE FROM tasks WHERE id=?",[req.params.id]); if(!result.affectedRows)return res.status(404).json({error:"Tarea no encontrada."}); res.json({success:true}); }
+  catch(err){res.status(500).json({error:"No se pudo eliminar la tarea.",details:err.message});}
+});
+
 app.get("/api/invoices", requireAuth, async (_req, res) => {
   try {
     const [rows] = await pool.execute(
@@ -729,6 +1219,41 @@ app.get("/api/invoices", requireAuth, async (_req, res) => {
   } catch (err) {
     res.status(500).json({ error: "Error al obtener facturas de MySQL.", details: err.message });
   }
+});
+
+app.post("/api/invoices", requireAuth, async (req,res) => {
+  const { clientName, amount, status="Pendiente", dueDate, description="" }=req.body;
+  if(!clientName?.trim() || !dueDate || !Number.isFinite(Number(amount))) return res.status(400).json({error:"Cliente, monto y fecha límite son obligatorios."});
+  const id=`inv_${Date.now()}`;
+  try { await pool.execute("INSERT INTO invoices (id,client_name,amount,status,due_date,description) VALUES (?,?,?,?,?,?)",[id,clientName.trim(),Number(amount),status,dueDate,description]); res.status(201).json({success:true,invoice:{id,clientName:clientName.trim(),amount:Number(amount),status,dueDate,description}}); }
+  catch(err){res.status(500).json({error:"No se pudo crear la factura.",details:err.message});}
+});
+
+app.patch("/api/invoices/:id", requireAuth, async (req,res) => {
+  const map={clientName:"client_name",amount:"amount",status:"status",dueDate:"due_date",description:"description"},sets=[],values=[];
+  for(const [key,column] of Object.entries(map))if(req.body[key]!==undefined){sets.push(`\`${column}\`=?`);values.push(req.body[key]);}
+  if(!sets.length)return res.status(400).json({error:"No hay cambios."}); values.push(req.params.id);
+  try{const [result]=await pool.execute(`UPDATE invoices SET ${sets.join(",")} WHERE id=?`,values);if(!result.affectedRows)return res.status(404).json({error:"Factura no encontrada."});res.json({success:true});}
+  catch(err){res.status(500).json({error:"No se pudo actualizar la factura.",details:err.message});}
+});
+
+app.delete("/api/invoices/:id", requireAuth, async (req,res) => {
+  try{const [result]=await pool.execute("DELETE FROM invoices WHERE id=?",[req.params.id]);if(!result.affectedRows)return res.status(404).json({error:"Factura no encontrada."});res.json({success:true});}
+  catch(err){res.status(500).json({error:"No se pudo eliminar la factura.",details:err.message});}
+});
+
+const MODULE_NAMES = new Set(["leads","services","renewals","quotes","staff","credentials"]);
+app.get("/api/module-data/:module", requireAuth, async (req,res) => {
+  if(!MODULE_NAMES.has(req.params.module))return res.status(404).json({error:"Módulo no válido."});
+  try{const [rows]=await pool.execute("SELECT data FROM module_data WHERE username=? AND module_name=?",[req.username,req.params.module]);const data=rows.length?(typeof rows[0].data==="string"?JSON.parse(rows[0].data):rows[0].data):null;res.json({data});}
+  catch(err){res.status(500).json({error:"No se pudo cargar el módulo.",details:err.message});}
+});
+
+app.put("/api/module-data/:module", requireAuth, async (req,res) => {
+  if(!MODULE_NAMES.has(req.params.module))return res.status(404).json({error:"Módulo no válido."});
+  if(!Array.isArray(req.body.data))return res.status(400).json({error:"Los datos deben ser una lista."});
+  try{await pool.execute("INSERT INTO module_data (username,module_name,data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[req.username,req.params.module,JSON.stringify(req.body.data)]);res.json({success:true});}
+  catch(err){res.status(500).json({error:"No se pudo guardar el módulo.",details:err.message});}
 });
 
 app.get("/api/reports/summary", requireAuth, async (_req, res) => {
@@ -760,10 +1285,10 @@ app.get("/api/reports/summary", requireAuth, async (_req, res) => {
 // ====================================================================
 // PROXY DE INTELIGENCIA ARTIFICIAL (GEMINI 3.5 FLASH)
 // ====================================================================
-app.post("/api/generate-component", async (req, res) => {
+app.post("/api/generate-component", requireAuth, aiLimiter, async (req, res) => {
   const { prompt } = req.body;
-  if (!prompt) {
-    return res.status(400).json({ error: "El prompt descriptivo es requerido." });
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 4000) {
+    return res.status(400).json({ error: "El prompt debe contener entre 1 y 4000 caracteres." });
   }
 
   const geminiApiKey = process.env.GEMINI_API_KEY;
@@ -827,6 +1352,15 @@ Reglas estrictas de diseño y código:
       details: error.message || error,
     });
   }
+});
+
+app.use((err, req, res, next) => {
+  console.error("Error HTTP controlado:", err.message);
+  if (res.headersSent) return next(err);
+  const isCorsError = err.message?.startsWith("Origen no permitido por CORS");
+  return res.status(isCorsError ? 403 : 500).json({
+    error: isCorsError ? "Origen no permitido." : "Error interno del servidor."
+  });
 });
 
 
