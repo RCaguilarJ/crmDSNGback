@@ -137,7 +137,7 @@ const pool = mysql.createPool({
       await ensureLocalSeedUsers();
       console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
     }
-    console.log("âœ… Usuarios semilla sincronizados para acceso local.");
+    console.log("Usuarios semilla sincronizados para acceso local.");
   } catch (error) {
     console.error("❌ Error conectando a la base de datos de WAMP (phpMyAdmin):");
     console.error(error.message);
@@ -279,7 +279,7 @@ async function revokeRefreshToken(token) {
   await pool.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", [tokenHash]);
 }
 
-const CLIENT_STATUSES = ["Activo", "PrÃ³ximo a vencer", "Vencido", "Suspendido"];
+const CLIENT_STATUSES = ["Activo", "Próximo a vencer", "Vencido", "Suspendido"];
 
 function getClientInitials(companyName = "") {
   const parts = companyName.trim().split(/\s+/).filter(Boolean);
@@ -1365,7 +1365,9 @@ app.use((err, req, res, next) => {
 
 
 // Servir archivos estáticos del build de React en Producción
-const distPath = path.join(__dirname, "../dist");
+const distPath = process.env.FRONTEND_DIST_PATH
+  ? path.resolve(process.env.FRONTEND_DIST_PATH)
+  : path.join(__dirname, "../crm-front/dist");
 app.use(express.static(distPath));
 
 // Ruta comodín para SPA Fallback de React
