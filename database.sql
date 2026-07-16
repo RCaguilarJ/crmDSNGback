@@ -12,12 +12,6 @@ SET time_zone = "-06:00";
 /*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
 /*!40101 SET NAMES utf8mb4 */;
 
---
--- 1. CREACIÓN DE LA BASE DE DATOS
---
-CREATE DATABASE IF NOT EXISTS `designs_crm` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE `designs_crm`;
-
 -- --------------------------------------------------------------------
 -- 2. TABLA DE USUARIOS / CORPORATIVOS
 -- --------------------------------------------------------------------
