@@ -40,6 +40,7 @@ const { rateLimit } = require("express-rate-limit");
 require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const cookieParser = require('cookie-parser');
+const webpush = require("web-push");
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 if (IS_PRODUCTION && !process.env.JWT_SECRET) {
@@ -50,6 +51,12 @@ if (!process.env.JWT_SECRET) {
   console.warn("⚠️ JWT_SECRET no configurado: se usará una clave efímera solo para desarrollo.");
 }
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1h";
+const PUSH_ENABLED = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT);
+if (PUSH_ENABLED) {
+  webpush.setVapidDetails(process.env.VAPID_SUBJECT, process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+} else {
+  console.warn("⚠️ Web Push desactivado: configura VAPID_SUBJECT, VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY.");
+}
 
 const app = express();
 app.disable("x-powered-by");
@@ -133,6 +140,7 @@ const pool = mysql.createPool({
     await ensureWebProjectsTable();
     await ensureSettingsTable();
     await ensureKanbanTable();
+    await ensurePushSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
       await ensureLocalSeedUsers();
       console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
@@ -207,6 +215,97 @@ async function ensureKanbanTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS kanban_cards (id VARCHAR(50) PRIMARY KEY, board VARCHAR(50) NOT NULL, stage VARCHAR(50) NOT NULL, title VARCHAR(180) NOT NULL, subtitle VARCHAR(180) DEFAULT '', priority ENUM('Alta','Media','Baja') DEFAULT 'Media', tags JSON NOT NULL, progress INT NULL, assignee VARCHAR(10) DEFAULT 'D', due_date VARCHAR(10) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
   const cards=[['k1','nuevo','AutoPartes del Norte','Prospecto','Media',['E-commerce'],null,'D','01-29'],['k2','nuevo','Clínica Dental Sonrisa','Prospecto','Media',['Landing'],null,'D','02-05'],['k3','contactado','Bufete Garza & Asoc.','Prospecto','Alta',['Web'],10,'D','01-22'],['k4','reunion','Constructora Pedraza','Prospecto','Alta',['Portal','Dev'],25,'C','01-18'],['k5','cotizacion','Distrib. Central GDL','Prospecto','Alta',['E-commerce'],50,'D','01-23'],['k6','seguimiento','Esc. Montessori Cima','Prospecto','Media',['LMS','Web'],60,'S','01-28'],['k7','ganado','Bufete Garza & Asoc.','Nuevo cliente','Alta',['Web'],100,'D','01-04'],['k8','perdido','Rest. La Hacienda','Excliente','Baja',['Landing'],null,'D','12-25']];
   for(const c of cards) await pool.execute("INSERT IGNORE INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,'comercial',?,?,?,?,?,?,?,?)",[c[0],c[1],c[2],c[3],c[4],JSON.stringify(c[5]),c[6],c[7],c[8]]);
+}
+
+async function ensurePushSchema() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id CHAR(64) NOT NULL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    endpoint TEXT NOT NULL,
+    p256dh VARCHAR(255) NOT NULL,
+    auth VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_push_username (username),
+    CONSTRAINT fk_push_user FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  await pool.execute(`CREATE TABLE IF NOT EXISTS push_deliveries (
+    subscription_id CHAR(64) NOT NULL,
+    event_key VARCHAR(190) NOT NULL,
+    delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (subscription_id, event_key),
+    CONSTRAINT fk_push_delivery_subscription FOREIGN KEY (subscription_id)
+      REFERENCES push_subscriptions(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+
+function pushSubscriptionId(endpoint) {
+  return crypto.createHash("sha256").update(endpoint).digest("hex");
+}
+
+async function sendPushToRows(rows, payload, eventKey = null) {
+  if (!PUSH_ENABLED) return;
+  await Promise.allSettled(rows.map(async (row) => {
+    if (eventKey) {
+      const [delivered] = await pool.execute(
+        "SELECT 1 FROM push_deliveries WHERE subscription_id=? AND event_key=? LIMIT 1",
+        [row.id, eventKey]
+      );
+      if (delivered.length) return;
+    }
+    try {
+      await webpush.sendNotification({ endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } }, JSON.stringify(payload), { TTL: 86400 });
+      if (eventKey) await pool.execute("INSERT IGNORE INTO push_deliveries (subscription_id,event_key) VALUES (?,?)", [row.id, eventKey]);
+    } catch (error) {
+      if (error.statusCode === 404 || error.statusCode === 410) {
+        await pool.execute("DELETE FROM push_subscriptions WHERE id=?", [row.id]);
+      } else {
+        console.error("No se pudo enviar Web Push:", error.message);
+      }
+    }
+  }));
+}
+
+async function sendPushToAssignee(assignee, payload) {
+  if (!PUSH_ENABLED || !assignee) return;
+  const [rows] = await pool.execute(
+    `SELECT ps.id,ps.endpoint,ps.p256dh,ps.auth
+       FROM push_subscriptions ps JOIN users u ON u.username=ps.username
+      WHERE LOWER(?) IN (LOWER(u.username), LOWER(u.name))
+         OR LOWER(u.name) LIKE CONCAT(LOWER(?), '%')`,
+    [assignee, assignee]
+  );
+  await sendPushToRows(rows, payload);
+}
+
+async function sendRenewalPushes() {
+  if (!PUSH_ENABLED) return;
+  try {
+    const [clientsDue] = await pool.execute(
+      `SELECT id,company_name AS companyName,next_renewal AS nextRenewal,
+              DATEDIFF(next_renewal,CURDATE()) AS days
+         FROM clients
+        WHERE next_renewal IS NOT NULL AND next_renewal <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+          AND status <> 'Suspendido'`
+    );
+    const [subscriptions] = await pool.execute(
+      `SELECT ps.id,ps.endpoint,ps.p256dh,ps.auth
+         FROM push_subscriptions ps JOIN users u ON u.username=ps.username
+        WHERE u.role IN ('Admin General','Administración','Gerente Dev','Gerente Web')`
+    );
+    for (const client of clientsDue) {
+      const days = Number(client.days);
+      const dateKey = new Date(client.nextRenewal).toISOString().slice(0, 10);
+      await sendPushToRows(subscriptions, {
+        title: days < 0 ? "Vencimiento de cliente" : "Renovación próxima",
+        body: days < 0 ? `${client.companyName} tiene un vencimiento pendiente.` : `${client.companyName} vence ${days === 0 ? "hoy" : `en ${days} día${days === 1 ? "" : "s"}`}.`,
+        url: "/?view=clients",
+        tag: `renewal:${client.id}:${dateKey}`
+      }, `renewal:${client.id}:${dateKey}`);
+    }
+  } catch (error) {
+    console.error("Error revisando vencimientos para Web Push:", error.message);
+  }
 }
 
 // Legacy helper para SHA256 con salt usado por los datos semilla heredados
@@ -1175,13 +1274,43 @@ app.get("/api/tasks", requireAuth, async (_req, res) => {
   }
 });
 
+app.get("/api/push/public-key", requireAuth, (_req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ error: "Web Push todavía no está configurado en el servidor." });
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+app.post("/api/push/subscribe", requireAuth, async (req, res) => {
+  const { endpoint, keys } = req.body || {};
+  if (!PUSH_ENABLED) return res.status(503).json({ error: "Web Push todavía no está configurado en el servidor." });
+  if (!endpoint || !keys?.p256dh || !keys?.auth) return res.status(400).json({ error: "Suscripción Push inválida." });
+  const id = pushSubscriptionId(endpoint);
+  try {
+    await pool.execute(
+      `INSERT INTO push_subscriptions (id,username,endpoint,p256dh,auth) VALUES (?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE username=VALUES(username),p256dh=VALUES(p256dh),auth=VALUES(auth),updated_at=CURRENT_TIMESTAMP`,
+      [id, req.username, endpoint, keys.p256dh, keys.auth]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: "No se pudo registrar este dispositivo.", details: error.message });
+  }
+});
+
+app.delete("/api/push/subscribe", requireAuth, async (req, res) => {
+  const endpoint = req.body?.endpoint;
+  if (!endpoint) return res.status(400).json({ error: "Endpoint obligatorio." });
+  await pool.execute("DELETE FROM push_subscriptions WHERE id=? AND username=?", [pushSubscriptionId(endpoint), req.username]);
+  res.json({ success: true });
+});
+
 app.post("/api/tasks", requireAuth, async (req, res) => {
   const { title, description = "", column = "Backlog", priority = "Media", projectName = null, assignee = null } = req.body;
   if (!title?.trim()) return res.status(400).json({ error: "El título es obligatorio." });
   const id = `t_${Date.now()}`;
   try {
     await pool.execute("INSERT INTO tasks (id,title,description,column_name,priority,project_name,assignee) VALUES (?,?,?,?,?,?,?)", [id,title.trim(),description,column,priority,projectName,assignee]);
-    res.status(201).json({ success: true, task: { id,title:title.trim(),description,column,columnName:column,priority,projectName,assignee } });
+    res.status(201).json({ success: true, task: { id,title:title.trim(),description,column,columnName:column,priority,projectName,assignee,createdAt:new Date().toISOString() } });
+    void sendPushToAssignee(assignee, { title: "Nueva tarea asignada", body: title.trim(), url: "/?view=tasks", tag: `task:${id}` });
   } catch (err) { res.status(500).json({ error: "No se pudo crear la tarea.", details: err.message }); }
 });
 
@@ -1191,7 +1320,7 @@ app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
   for (const [key,column] of Object.entries(map)) if (req.body[key] !== undefined) { sets.push(`\`${column}\`=?`); values.push(req.body[key]); }
   if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
   values.push(req.params.id);
-  try { const [result]=await pool.execute(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`,values); if(!result.affectedRows)return res.status(404).json({error:"Tarea no encontrada."}); res.json({success:true}); }
+  try { const [result]=await pool.execute(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`,values); if(!result.affectedRows)return res.status(404).json({error:"Tarea no encontrada."}); res.json({success:true}); if(req.body.assignee){const [taskRows]=await pool.execute("SELECT title FROM tasks WHERE id=?",[req.params.id]);if(taskRows.length)void sendPushToAssignee(req.body.assignee,{title:"Tarea asignada",body:taskRows[0].title,url:"/?view=tasks",tag:`task:${req.params.id}:${Date.now()}`});} }
   catch(err){res.status(500).json({error:"No se pudo actualizar la tarea.",details:err.message});}
 });
 
@@ -1381,4 +1510,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 DESIGNS CRM - SERVIDOR DE RESPALDO WAMP MYSQL`);
   console.log(`🖥️  Local: http://localhost:${PORT}`);
   console.log(`====================================================`);
+  setTimeout(() => void sendRenewalPushes(), 15_000);
+  setInterval(() => void sendRenewalPushes(), 6 * 60 * 60 * 1000);
 });

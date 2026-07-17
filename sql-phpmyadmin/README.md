@@ -11,3 +11,4 @@ Para una instalación nueva puedes importar directamente `../database.sql`; ya c
 La primera vez que cada usuario abra un módulo, los datos existentes en `localStorage` se migrarán a MySQL automáticamente.
 
 > Importante: el módulo de credenciales conserva el comportamiento actual y almacena las contraseñas dentro del JSON. Restringe el acceso a MySQL y realiza respaldos seguros.
+Para habilitar notificaciones Web Push en una instalación existente, importa también `003_web_push.sql`. El backend intenta crear estas tablas automáticamente; este archivo sirve para hostings que bloquean el permiso `CREATE` al usuario de Node.
