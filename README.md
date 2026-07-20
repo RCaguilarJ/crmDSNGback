@@ -44,6 +44,21 @@ npm run dev
 
 El servidor estará corriendo en: `http://localhost:3000`.
 
+### Pruebas locales sin modificar producción
+
+Usa `.env.local` para los datos de WAMP y ejecuta:
+
+```bash
+npm run dev:local
+```
+
+Este comando carga primero `.env.local` y después inicia el servidor. El archivo
+está ignorado por Git. `npm start` conserva el comportamiento actual y continúa
+usando `.env`, por lo que la configuración destinada a producción no cambia.
+Mantén esta terminal abierta mientras usas el frontend; si se cierra, el
+navegador mostrará `ERR_CONNECTION_REFUSED`. En local, `ENABLE_DEMO_SEED=true`
+habilita los cuatro botones de acceso rápido sin afectar producción.
+
 ---
 
 ## 💡 Credenciales de Acceso Semilla (Cargadas en SQL)

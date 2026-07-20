@@ -137,9 +137,11 @@ const pool = mysql.createPool({
     connection.release();
     await ensureAuthSchema();
     await ensureUserProfileColumns();
+    await ensureDeletedUsersTable();
     await ensureWebProjectsTable();
     await ensureSettingsTable();
     await ensureKanbanTable();
+    await ensureInvoiceColumns();
     await ensurePushSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
       await ensureLocalSeedUsers();
@@ -181,6 +183,33 @@ async function ensureUserProfileColumns() {
     area=COALESCE(area,CASE role WHEN 'Admin General' THEN 'Dirección' WHEN 'Administración' THEN 'Administración' WHEN 'Gerente Dev' THEN 'Desarrollo' WHEN 'Gerente Web' THEN 'Páginas web' ELSE 'General' END)`);
 }
 
+async function ensureDeletedUsersTable() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS deleted_users (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    name VARCHAR(120) NULL,
+    email VARCHAR(150) NULL,
+    role VARCHAR(50) NULL,
+    area VARCHAR(100) NULL,
+    status VARCHAR(20) NULL,
+    snapshot JSON NOT NULL,
+    deleted_by VARCHAR(50) NOT NULL,
+    deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_deleted_users_username (username),
+    INDEX idx_deleted_users_date (deleted_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+
+async function restoreSnapshotRows(connection, table, rows) {
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const columns = Object.keys(row);
+    if (!columns.length) continue;
+    const escapedColumns = columns.map((column) => `\`${column.replace(/`/g, "``")}\``).join(",");
+    const placeholders = columns.map(() => "?").join(",");
+    await connection.execute(`INSERT IGNORE INTO \`${table}\` (${escapedColumns}) VALUES (${placeholders})`, columns.map((column) => row[column]));
+  }
+}
+
 async function ensureWebProjectsTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS web_projects (
     id VARCHAR(50) NOT NULL PRIMARY KEY,
@@ -215,6 +244,19 @@ async function ensureKanbanTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS kanban_cards (id VARCHAR(50) PRIMARY KEY, board VARCHAR(50) NOT NULL, stage VARCHAR(50) NOT NULL, title VARCHAR(180) NOT NULL, subtitle VARCHAR(180) DEFAULT '', priority ENUM('Alta','Media','Baja') DEFAULT 'Media', tags JSON NOT NULL, progress INT NULL, assignee VARCHAR(10) DEFAULT 'D', due_date VARCHAR(10) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
   const cards=[['k1','nuevo','AutoPartes del Norte','Prospecto','Media',['E-commerce'],null,'D','01-29'],['k2','nuevo','Clínica Dental Sonrisa','Prospecto','Media',['Landing'],null,'D','02-05'],['k3','contactado','Bufete Garza & Asoc.','Prospecto','Alta',['Web'],10,'D','01-22'],['k4','reunion','Constructora Pedraza','Prospecto','Alta',['Portal','Dev'],25,'C','01-18'],['k5','cotizacion','Distrib. Central GDL','Prospecto','Alta',['E-commerce'],50,'D','01-23'],['k6','seguimiento','Esc. Montessori Cima','Prospecto','Media',['LMS','Web'],60,'S','01-28'],['k7','ganado','Bufete Garza & Asoc.','Nuevo cliente','Alta',['Web'],100,'D','01-04'],['k8','perdido','Rest. La Hacienda','Excliente','Baja',['Landing'],null,'D','12-25']];
   for(const c of cards) await pool.execute("INSERT IGNORE INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,'comercial',?,?,?,?,?,?,?,?)",[c[0],c[1],c[2],c[3],c[4],JSON.stringify(c[5]),c[6],c[7],c[8]]);
+}
+
+async function ensureInvoiceColumns() {
+  await pool.query("ALTER TABLE invoices MODIFY COLUMN due_date DATE NULL");
+  const columns = [
+    ["payment_date", "DATE NULL"],
+    ["payment_method", "VARCHAR(40) NULL"],
+    ["is_invoiced", "TINYINT(1) NOT NULL DEFAULT 0"]
+  ];
+  for (const [name, definition] of columns) {
+    const [found] = await pool.execute("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='invoices' AND COLUMN_NAME=?", [name]);
+    if (!found.length) await pool.query(`ALTER TABLE invoices ADD COLUMN \`${name}\` ${definition}`);
+  }
 }
 
 async function ensurePushSchema() {
@@ -800,6 +842,35 @@ app.get("/api/users", requireAuth, async (_req, res) => {
   } catch(err){res.status(500).json({error:"No se pudo cargar el directorio.",details:err.message});}
 });
 
+app.get("/api/users-trash", requireAuth, async (req, res) => {
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  try {
+    const [rows] = await pool.execute("SELECT id,username,name,email,role,area,status,deleted_by AS deletedBy,deleted_at AS deletedAt FROM deleted_users ORDER BY deleted_at DESC");
+    res.json({users:rows});
+  } catch(err){res.status(500).json({error:"No se pudo cargar la papelera.",details:err.message});}
+});
+
+app.post("/api/users-trash/:id/restore", requireAuth, async (req,res)=>{
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [archives] = await connection.execute("SELECT snapshot FROM deleted_users WHERE id=? FOR UPDATE",[req.params.id]);
+    if(!archives.length){await connection.rollback();return res.status(404).json({error:"El usuario ya no está en la papelera."});}
+    const snapshot=typeof archives[0].snapshot==="string"?JSON.parse(archives[0].snapshot):archives[0].snapshot;
+    const user=snapshot.user;
+    const columns=Object.keys(user), escaped=columns.map(key=>`\`${key.replace(/`/g,"``")}\``).join(","), placeholders=columns.map(()=>"?").join(",");
+    await connection.execute(`INSERT INTO users (${escaped}) VALUES (${placeholders})`,columns.map(key=>user[key]));
+    await restoreSnapshotRows(connection,"projects",snapshot.projects);
+    await restoreSnapshotRows(connection,"web_projects",snapshot.webProjects);
+    await restoreSnapshotRows(connection,"module_data",snapshot.moduleData);
+    await connection.execute("DELETE FROM deleted_users WHERE id=?",[req.params.id]);
+    await connection.commit();
+    res.json({success:true});
+  } catch(err){await connection.rollback();res.status(err.code==="ER_DUP_ENTRY"?409:500).json({error:err.code==="ER_DUP_ENTRY"?"Ya existe un usuario con ese identificador.":"No se pudo restaurar el usuario.",details:err.message});}
+  finally{connection.release();}
+});
+
 app.post("/api/users", requireAuth, async (req,res)=>{
   if(req.role!=="Admin General") return res.status(403).json({error:"Solo Admin General puede crear usuarios."});
   const {username,name,email,password,role,area,status}=req.body;
@@ -833,7 +904,21 @@ app.put("/api/users/:username", requireAuth, async (req,res)=>{
 app.delete("/api/users/:username", requireAuth, async (req,res)=>{
   if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
   if(req.params.username==="adriana") return res.status(400).json({error:"No se puede eliminar al administrador principal."});
-  try{await pool.execute("DELETE FROM users WHERE username=?",[req.params.username]);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo eliminar.",details:err.message});}
+  const connection=await pool.getConnection();
+  try{
+    await connection.beginTransaction();
+    const [users]=await connection.execute("SELECT * FROM users WHERE username=? FOR UPDATE",[req.params.username]);
+    if(!users.length){await connection.rollback();return res.status(404).json({error:"Usuario no encontrado."});}
+    const [projects]=await connection.execute("SELECT * FROM projects WHERE username=?",[req.params.username]);
+    const [webProjects]=await connection.execute("SELECT * FROM web_projects WHERE username=?",[req.params.username]);
+    const [moduleData]=await connection.execute("SELECT * FROM module_data WHERE username=?",[req.params.username]);
+    const user=users[0], snapshot={user,projects,webProjects,moduleData};
+    await connection.execute("INSERT INTO deleted_users (username,name,email,role,area,status,snapshot,deleted_by) VALUES (?,?,?,?,?,?,?,?)",[user.username,user.name,user.email,user.role,user.area,user.status,JSON.stringify(snapshot),req.username]);
+    await connection.execute("DELETE FROM users WHERE username=?",[req.params.username]);
+    await connection.commit();
+    res.json({success:true,recoverable:true});
+  }catch(err){await connection.rollback();res.status(500).json({error:"No se pudo mover el usuario a la papelera.",details:err.message});}
+  finally{connection.release();}
 });
 
 const DEFAULT_SETTINGS = {companyName:"Designs Agency S.A. de C.V.",rfc:"DAG240115TJ1",email:"hola@designs.mx",phone:"+52 664 123 4567",city:"Tijuana, Baja California",country:"México",systemNotifications:true,emailAlerts:true,overduePayments:true,upcomingRenewals:true,delayedProjects:true,newLeads:true,currency:"MXN",timezone:"America/Tijuana",language:"es-MX",dateFormat:"DD/MM/YYYY",sessionTimeout:10,twoFactor:false};
@@ -1338,6 +1423,9 @@ app.get("/api/invoices", requireAuth, async (_req, res) => {
         amount,
         status,
         due_date AS dueDate,
+        payment_date AS paymentDate,
+        payment_method AS paymentMethod,
+        is_invoiced AS isInvoiced,
         description,
         created_at AS createdAt
       FROM invoices
@@ -1351,15 +1439,15 @@ app.get("/api/invoices", requireAuth, async (_req, res) => {
 });
 
 app.post("/api/invoices", requireAuth, async (req,res) => {
-  const { clientName, amount, status="Pendiente", dueDate, description="" }=req.body;
-  if(!clientName?.trim() || !dueDate || !Number.isFinite(Number(amount))) return res.status(400).json({error:"Cliente, monto y fecha límite son obligatorios."});
+  const { clientName, amount, status="Pendiente", dueDate=null, paymentDate=null, paymentMethod=null, isInvoiced=false, description="" }=req.body;
+  if(!clientName?.trim() || !Number.isFinite(Number(amount))) return res.status(400).json({error:"Cliente y monto son obligatorios."});
   const id=`inv_${Date.now()}`;
-  try { await pool.execute("INSERT INTO invoices (id,client_name,amount,status,due_date,description) VALUES (?,?,?,?,?,?)",[id,clientName.trim(),Number(amount),status,dueDate,description]); res.status(201).json({success:true,invoice:{id,clientName:clientName.trim(),amount:Number(amount),status,dueDate,description}}); }
+  try { await pool.execute("INSERT INTO invoices (id,client_name,amount,status,due_date,payment_date,payment_method,is_invoiced,description) VALUES (?,?,?,?,?,?,?,?,?)",[id,clientName.trim(),Number(amount),status,dueDate||null,paymentDate||null,paymentMethod||null,isInvoiced?1:0,description]); res.status(201).json({success:true,invoice:{id,clientName:clientName.trim(),amount:Number(amount),status,dueDate:dueDate||"",paymentDate:paymentDate||"",paymentMethod:paymentMethod||"",isInvoiced:Boolean(isInvoiced),description}}); }
   catch(err){res.status(500).json({error:"No se pudo crear la factura.",details:err.message});}
 });
 
 app.patch("/api/invoices/:id", requireAuth, async (req,res) => {
-  const map={clientName:"client_name",amount:"amount",status:"status",dueDate:"due_date",description:"description"},sets=[],values=[];
+  const map={clientName:"client_name",amount:"amount",status:"status",dueDate:"due_date",paymentDate:"payment_date",paymentMethod:"payment_method",isInvoiced:"is_invoiced",description:"description"},sets=[],values=[];
   for(const [key,column] of Object.entries(map))if(req.body[key]!==undefined){sets.push(`\`${column}\`=?`);values.push(req.body[key]);}
   if(!sets.length)return res.status(400).json({error:"No hay cambios."}); values.push(req.params.id);
   try{const [result]=await pool.execute(`UPDATE invoices SET ${sets.join(",")} WHERE id=?`,values);if(!result.affectedRows)return res.status(404).json({error:"Factura no encontrada."});res.json({success:true});}

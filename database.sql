@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS `refresh_tokens` (
   FOREIGN KEY (`username`) REFERENCES `users` (`username`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `deleted_users` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `username` VARCHAR(50) NOT NULL,
+  `name` VARCHAR(120) DEFAULT NULL,
+  `email` VARCHAR(150) DEFAULT NULL,
+  `role` VARCHAR(50) DEFAULT NULL,
+  `area` VARCHAR(100) DEFAULT NULL,
+  `status` VARCHAR(20) DEFAULT NULL,
+  `snapshot` JSON NOT NULL,
+  `deleted_by` VARCHAR(50) NOT NULL,
+  `deleted_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_deleted_users_username` (`username`),
+  INDEX `idx_deleted_users_date` (`deleted_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `push_subscriptions` (
   `id` CHAR(64) NOT NULL PRIMARY KEY,
   `username` VARCHAR(50) NOT NULL,
@@ -111,7 +126,10 @@ CREATE TABLE IF NOT EXISTS `invoices` (
   `client_name` VARCHAR(150) NOT NULL,
   `amount` DECIMAL(12,2) NOT NULL,
   `status` ENUM('Pagado', 'Pendiente', 'Vencido') NOT NULL DEFAULT 'Pendiente',
-  `due_date` DATE NOT NULL,
+  `due_date` DATE DEFAULT NULL,
+  `payment_date` DATE DEFAULT NULL,
+  `payment_method` VARCHAR(40) DEFAULT NULL,
+  `is_invoiced` TINYINT(1) NOT NULL DEFAULT 0,
   `description` TEXT DEFAULT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

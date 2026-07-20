@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "dev:local": "node --env-file-if-exists=.env.local --watch server.js",
     "push:keys": "web-push generate-vapid-keys"
   },
   "keywords": [
