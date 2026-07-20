@@ -335,6 +335,18 @@ async function sendPushToAssignee(assignee, payload) {
   await sendPushToRows(rows, payload);
 }
 
+async function sendPushToOtherUsers(actorUsername, payload) {
+  if (!PUSH_ENABLED || !actorUsername) return;
+  const [rows] = await pool.execute(
+    `SELECT ps.id,ps.endpoint,ps.p256dh,ps.auth
+       FROM push_subscriptions ps
+       JOIN users u ON u.username=ps.username
+      WHERE ps.username<>? AND u.status='Activo'`,
+    [actorUsername]
+  );
+  await sendPushToRows(rows, payload);
+}
+
 async function sendRenewalPushes() {
   if (!PUSH_ENABLED) return;
   try {
@@ -1421,8 +1433,32 @@ app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
   for (const [key,column] of Object.entries(map)) if (req.body[key] !== undefined) { sets.push(`\`${column}\`=?`); values.push(req.body[key]); }
   if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
   values.push(req.params.id);
-  try { const [result]=await pool.execute(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`,values); if(!result.affectedRows)return res.status(404).json({error:"Tarea no encontrada."}); res.json({success:true}); if(req.body.assignee){const [taskRows]=await pool.execute("SELECT title FROM tasks WHERE id=?",[req.params.id]);if(taskRows.length)void sendPushToAssignee(req.body.assignee,{title:"Tarea asignada",body:taskRows[0].title,url:"/?view=tasks",tag:`task:${req.params.id}:${Date.now()}`});} }
-  catch(err){res.status(500).json({error:"No se pudo actualizar la tarea.",details:err.message});}
+  try {
+    const [beforeRows] = await pool.execute("SELECT title,status FROM tasks WHERE id=?", [req.params.id]);
+    if (!beforeRows.length) return res.status(404).json({ error:"Tarea no encontrada." });
+    await pool.execute(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`, values);
+    const taskTitle = req.body.title?.trim() || beforeRows[0].title;
+    res.json({ success:true });
+
+    if (req.body.assignee) {
+      void sendPushToAssignee(req.body.assignee, {
+        title:"Tarea asignada",
+        body:taskTitle,
+        url:"/?view=tasks",
+        tag:`task:${req.params.id}:${Date.now()}`
+      }).catch((error) => console.error("No se pudo notificar la asignación:", error.message));
+    }
+    if (req.body.status !== undefined && req.body.status !== beforeRows[0].status) {
+      void sendPushToOtherUsers(req.username, {
+        title:"Estado de tarea actualizado",
+        body:`${taskTitle}: ${beforeRows[0].status} → ${req.body.status}`,
+        url:"/?view=tasks",
+        tag:`task-status:${req.params.id}:${Date.now()}`
+      }).catch((error) => console.error("No se pudo notificar el cambio de estado:", error.message));
+    }
+  } catch(err) {
+    res.status(500).json({ error:"No se pudo actualizar la tarea.",details:err.message });
+  }
 });
 
 app.delete("/api/tasks/:id", requireAuth, async (req,res) => {
