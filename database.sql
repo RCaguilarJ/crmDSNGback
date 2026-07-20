@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS `tasks` (
   `title` VARCHAR(255) NOT NULL,
   `description` TEXT DEFAULT NULL,
   `column_name` ENUM('Backlog', 'Diseño', 'Desarrollo', 'QA', 'Entregado') NOT NULL DEFAULT 'Backlog',
+  `status` VARCHAR(20) NOT NULL DEFAULT 'Pendiente',
   `priority` ENUM('Baja', 'Media', 'Alta') NOT NULL DEFAULT 'Media',
   `project_name` VARCHAR(150) DEFAULT NULL,
   `assignee` VARCHAR(100) DEFAULT NULL,

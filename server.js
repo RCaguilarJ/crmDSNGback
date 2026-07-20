@@ -141,6 +141,7 @@ const pool = mysql.createPool({
     await ensureWebProjectsTable();
     await ensureSettingsTable();
     await ensureKanbanTable();
+    await ensureTaskStatusColumn();
     await ensureInvoiceColumns();
     await ensurePushSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
@@ -244,6 +245,20 @@ async function ensureKanbanTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS kanban_cards (id VARCHAR(50) PRIMARY KEY, board VARCHAR(50) NOT NULL, stage VARCHAR(50) NOT NULL, title VARCHAR(180) NOT NULL, subtitle VARCHAR(180) DEFAULT '', priority ENUM('Alta','Media','Baja') DEFAULT 'Media', tags JSON NOT NULL, progress INT NULL, assignee VARCHAR(10) DEFAULT 'D', due_date VARCHAR(10) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
   const cards=[['k1','nuevo','AutoPartes del Norte','Prospecto','Media',['E-commerce'],null,'D','01-29'],['k2','nuevo','Clínica Dental Sonrisa','Prospecto','Media',['Landing'],null,'D','02-05'],['k3','contactado','Bufete Garza & Asoc.','Prospecto','Alta',['Web'],10,'D','01-22'],['k4','reunion','Constructora Pedraza','Prospecto','Alta',['Portal','Dev'],25,'C','01-18'],['k5','cotizacion','Distrib. Central GDL','Prospecto','Alta',['E-commerce'],50,'D','01-23'],['k6','seguimiento','Esc. Montessori Cima','Prospecto','Media',['LMS','Web'],60,'S','01-28'],['k7','ganado','Bufete Garza & Asoc.','Nuevo cliente','Alta',['Web'],100,'D','01-04'],['k8','perdido','Rest. La Hacienda','Excliente','Baja',['Landing'],null,'D','12-25']];
   for(const c of cards) await pool.execute("INSERT IGNORE INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,'comercial',?,?,?,?,?,?,?,?)",[c[0],c[1],c[2],c[3],c[4],JSON.stringify(c[5]),c[6],c[7],c[8]]);
+}
+
+async function ensureTaskStatusColumn() {
+  const [found] = await pool.execute("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tasks' AND COLUMN_NAME='status'");
+  if (!found.length) {
+    await pool.query("ALTER TABLE tasks ADD COLUMN status VARCHAR(20) NULL AFTER column_name");
+    await pool.query(`UPDATE tasks SET status=CASE
+      WHEN column_name='Entregado' THEN 'Completada'
+      WHEN column_name='Backlog' THEN 'Pendiente'
+      WHEN column_name='QA' THEN 'Urgente'
+      ELSE 'En proceso'
+    END WHERE status IS NULL`);
+    await pool.query("ALTER TABLE tasks MODIFY COLUMN status VARCHAR(20) NOT NULL DEFAULT 'Pendiente'");
+  }
 }
 
 async function ensureInvoiceColumns() {
@@ -1345,6 +1360,7 @@ app.get("/api/tasks", requireAuth, async (_req, res) => {
         title,
         description,
         column_name AS columnName,
+        status,
         priority,
         project_name AS projectName,
         assignee,
@@ -1389,18 +1405,18 @@ app.delete("/api/push/subscribe", requireAuth, async (req, res) => {
 });
 
 app.post("/api/tasks", requireAuth, async (req, res) => {
-  const { title, description = "", column = "Backlog", priority = "Media", projectName = null, assignee = null } = req.body;
+  const { title, description = "", column = "Backlog", status = "Pendiente", priority = "Media", projectName = null, assignee = null } = req.body;
   if (!title?.trim()) return res.status(400).json({ error: "El título es obligatorio." });
   const id = `t_${Date.now()}`;
   try {
-    await pool.execute("INSERT INTO tasks (id,title,description,column_name,priority,project_name,assignee) VALUES (?,?,?,?,?,?,?)", [id,title.trim(),description,column,priority,projectName,assignee]);
-    res.status(201).json({ success: true, task: { id,title:title.trim(),description,column,columnName:column,priority,projectName,assignee,createdAt:new Date().toISOString() } });
+    await pool.execute("INSERT INTO tasks (id,title,description,column_name,status,priority,project_name,assignee) VALUES (?,?,?,?,?,?,?,?)", [id,title.trim(),description,column,status,priority,projectName,assignee]);
+    res.status(201).json({ success: true, task: { id,title:title.trim(),description,column,columnName:column,status,priority,projectName,assignee,createdAt:new Date().toISOString() } });
     void sendPushToAssignee(assignee, { title: "Nueva tarea asignada", body: title.trim(), url: "/?view=tasks", tag: `task:${id}` });
   } catch (err) { res.status(500).json({ error: "No se pudo crear la tarea.", details: err.message }); }
 });
 
 app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
-  const map = { title:"title", description:"description", column:"column_name", priority:"priority", projectName:"project_name", assignee:"assignee" };
+  const map = { title:"title", description:"description", column:"column_name", status:"status", priority:"priority", projectName:"project_name", assignee:"assignee" };
   const sets=[], values=[];
   for (const [key,column] of Object.entries(map)) if (req.body[key] !== undefined) { sets.push(`\`${column}\`=?`); values.push(req.body[key]); }
   if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
