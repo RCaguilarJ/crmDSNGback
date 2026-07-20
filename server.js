@@ -139,12 +139,14 @@ const pool = mysql.createPool({
     await ensureUserProfileColumns();
     await ensureDeletedUsersTable();
     await ensureWebProjectsTable();
+    await ensureProjectColumns();
     await ensureSettingsTable();
     await ensureKanbanTable();
     await ensureTaskStatusColumn();
     await ensureInvoiceColumns();
     await ensurePushSchema();
     await ensureNotificationsSchema();
+    await ensureRecordAccessSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
       await ensureLocalSeedUsers();
       console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
@@ -234,6 +236,18 @@ async function ensureWebProjectsTable() {
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 }
 
+async function ensureProjectColumns() {
+  const columns = [
+    ["client_name","VARCHAR(150) NULL"], ["status","VARCHAR(40) NULL"], ["due_date","DATE NULL"],
+    ["budget","DECIMAL(12,2) NULL"], ["manager","VARCHAR(120) NULL"], ["devs","JSON NULL"],
+    ["start_date","DATE NULL"], ["progress","INT NULL"], ["priority","VARCHAR(20) NULL"]
+  ];
+  for (const [name,definition] of columns) {
+    const [found] = await pool.execute("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME=?",[name]);
+    if (!found.length) await pool.query(`ALTER TABLE projects ADD COLUMN \`${name}\` ${definition}`);
+  }
+}
+
 async function ensureSettingsTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS settings (
     id TINYINT NOT NULL PRIMARY KEY DEFAULT 1,
@@ -314,6 +328,44 @@ async function ensureNotificationsSchema() {
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 }
 
+async function ensureRecordAccessSchema() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS record_access (
+    module_name VARCHAR(50) NOT NULL,
+    record_id VARCHAR(100) NOT NULL,
+    username VARCHAR(50) NOT NULL,
+    is_owner TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (module_name,record_id,username),
+    INDEX idx_record_access_user (username,module_name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  await pool.execute(`CREATE TABLE IF NOT EXISTS shared_module_records (
+    module_name VARCHAR(50) NOT NULL,
+    record_id VARCHAR(100) NOT NULL,
+    owner_username VARCHAR(50) NOT NULL,
+    data JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (module_name,record_id),
+    INDEX idx_shared_module_owner (owner_username,module_name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  const [legacyRows] = await pool.execute("SELECT username,module_name,data FROM module_data");
+  for (const row of legacyRows) {
+    const items = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
+    for (const item of Array.isArray(items) ? items : []) {
+      if (!item?.id) continue;
+      await pool.execute("INSERT IGNORE INTO shared_module_records (module_name,record_id,owner_username,data) VALUES (?,?,?,?)", [row.module_name,String(item.id),row.username,JSON.stringify(item)]);
+      await pool.execute("INSERT IGNORE INTO record_access (module_name,record_id,username,is_owner) VALUES (?,?,?,1)", [row.module_name,String(item.id),row.username]);
+    }
+  }
+  await pool.query("INSERT IGNORE INTO record_access (module_name,record_id,username,is_owner) SELECT 'projects',id,username,1 FROM projects");
+  await pool.query("INSERT IGNORE INTO record_access (module_name,record_id,username,is_owner) SELECT 'projects_web',id,username,1 FROM web_projects");
+  const physicalTables = {clients:"clients",projects:"projects",projects_web:"web_projects",kanban:"kanban_cards",tasks:"tasks",billing:"invoices"};
+  for (const [moduleName,table] of Object.entries(physicalTables)) {
+    await pool.query(`DELETE ra FROM record_access ra LEFT JOIN \`${table}\` source ON source.id=ra.record_id WHERE ra.module_name=? AND source.id IS NULL`,[moduleName]);
+  }
+  await pool.query("DELETE ra FROM record_access ra LEFT JOIN shared_module_records source ON source.module_name=ra.module_name AND source.record_id=ra.record_id WHERE ra.module_name IN ('leads','services','renewals','quotes','staff','credentials') AND source.record_id IS NULL");
+}
+
 function pushSubscriptionId(endpoint) {
   return crypto.createHash("sha256").update(endpoint).digest("hex");
 }
@@ -363,12 +415,16 @@ async function sendRenewalPushes() {
         WHERE next_renewal IS NOT NULL AND next_renewal <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
           AND status <> 'Suspendido'`
     );
-    const [subscriptions] = await pool.execute(
-      `SELECT ps.id,ps.endpoint,ps.p256dh,ps.auth
-         FROM push_subscriptions ps JOIN users u ON u.username=ps.username
-        WHERE u.role IN ('Admin General','Administración','Gerente Dev','Gerente Web')`
-    );
     for (const client of clientsDue) {
+      const [subscriptions] = await pool.execute(
+        `SELECT ps.id,ps.endpoint,ps.p256dh,ps.auth
+           FROM push_subscriptions ps JOIN users u ON u.username=ps.username
+          WHERE u.role IN ('Admin General','Administración','Gerente Dev','Gerente Web')
+            AND (u.role='Admin General'
+              OR NOT EXISTS (SELECT 1 FROM record_access ra0 WHERE ra0.module_name='clients' AND ra0.record_id=?)
+              OR EXISTS (SELECT 1 FROM record_access ra WHERE ra.module_name='clients' AND ra.record_id=? AND ra.username=u.username))`,
+        [client.id,client.id]
+      );
       const days = Number(client.days);
       const dateKey = new Date(client.nextRenewal).toISOString().slice(0, 10);
       await sendPushToRows(subscriptions, {
@@ -574,6 +630,59 @@ const NOTIFICATION_MODULES = {
   credentials: { permission:"credentials", view:"credentials", singular:"registro de credenciales" }
 };
 
+const ASSIGNMENT_FIELDS = new Set(["manager","designer","builder","responsible","assignee","assignedTo","assignedUsers","devs","developers","staff","user","username"]);
+
+function normalizedPerson(value) {
+  return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
+}
+
+function assignmentValues(source) {
+  const values = [];
+  const visit = (value, key = "") => {
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
+    if (value && typeof value === "object") return Object.entries(value).forEach(([childKey,child]) => visit(child, childKey));
+    if (ASSIGNMENT_FIELDS.has(key) && typeof value === "string" && value.trim()) values.push(value.trim());
+  };
+  visit(source);
+  return values;
+}
+
+async function resolveAssignedUsers(source) {
+  const candidates = assignmentValues(source).map(normalizedPerson);
+  if (!candidates.length) return [];
+  const [users] = await pool.execute("SELECT username,name FROM users WHERE status='Activo'");
+  return users.filter((user) => {
+    const username = normalizedPerson(user.username);
+    const name = normalizedPerson(user.name);
+    const initials = name.split(/\s+/).filter(Boolean).map((part) => part[0]).join("");
+    return candidates.some((candidate) => candidate === username || candidate === name || name.startsWith(`${candidate} `) || candidate === initials || (candidate.length === 1 && username.startsWith(candidate)));
+  }).map((user) => user.username);
+}
+
+async function syncRecordAccess(moduleName, recordId, actorUsername, source, preserveOwner = true) {
+  const id = String(recordId);
+  const rawAssignments = assignmentValues(source);
+  if (preserveOwner && !rawAssignments.length) return;
+  const [owners] = preserveOwner ? await pool.execute("SELECT username FROM record_access WHERE module_name=? AND record_id=? AND is_owner=1", [moduleName,id]) : [[]];
+  const owner = owners[0]?.username || actorUsername;
+  const assigned = await resolveAssignedUsers(source);
+  const usernames = [...new Set([owner,...assigned])];
+  await pool.execute("DELETE FROM record_access WHERE module_name=? AND record_id=?", [moduleName,id]);
+  for (const username of usernames) {
+    await pool.execute("INSERT INTO record_access (module_name,record_id,username,is_owner) VALUES (?,?,?,?)", [moduleName,id,username,username === owner ? 1 : 0]);
+  }
+}
+
+function accessSql(moduleName, idExpression = "id") {
+  return `(NOT EXISTS (SELECT 1 FROM record_access ra0 WHERE ra0.module_name='${moduleName}' AND ra0.record_id=${idExpression}) OR EXISTS (SELECT 1 FROM record_access ra WHERE ra.module_name='${moduleName}' AND ra.record_id=${idExpression} AND ra.username=?))`;
+}
+
+async function userCanAccessRecord(req, moduleName, recordId) {
+  if (req.role === "Admin General") return true;
+  const [rows] = await pool.execute(`SELECT ${accessSql(moduleName, "?")} allowed`, [String(recordId),String(recordId),req.username]);
+  return Boolean(rows[0]?.allowed);
+}
+
 function notificationContext(req) {
   const parts = req.path.split("/").filter(Boolean);
   if (parts[0] !== "api") return null;
@@ -614,7 +723,16 @@ async function createPlatformNotification(req) {
   const [actorRows] = await pool.execute("SELECT name FROM users WHERE username=? LIMIT 1", [req.username]);
   const actorName = actorRows[0]?.name || req.username;
   const [users] = await pool.execute("SELECT username,role FROM users WHERE status='Activo' AND username<>?", [req.username]);
-  const recipients = users.filter((user) => allowedRoles.includes(ROLE_KEY_BY_NAME[user.role]));
+  const pathParts = req.path.split("/").filter(Boolean);
+  const pathId = req.method === "POST" || pathParts[1] === "module-data" ? null : pathParts.at(-1);
+  const recordId = req.auditRecordId || pathId;
+  const [accessRows] = recordId ? await pool.execute("SELECT username FROM record_access WHERE module_name=? AND record_id=?",[context.permission,String(recordId)]) : [[]];
+  const accessibleUsers = new Set(accessRows.map((row) => row.username));
+  const recipients = users.filter((user) => {
+    if (user.role === "Admin General") return true;
+    const roleAllowed = allowedRoles.includes(ROLE_KEY_BY_NAME[user.role]);
+    return accessRows.length ? accessibleUsers.has(user.username) : roleAllowed;
+  });
   if (!recipients.length) return;
   const entity = notificationEntity(req);
   const action = notificationAction(req);
@@ -644,19 +762,28 @@ app.use((req, res, next) => {
   if (!mutating) return next();
   res.on("finish", () => {
     if (res.statusCode < 400 && req.username && notificationContext(req)) {
-      void createPlatformNotification(req).catch((error) => console.error("No se pudo registrar la notificación:", error.message));
+      void (async () => {
+        await createPlatformNotification(req);
+        const context = notificationContext(req);
+        const ids = req.auditRecordIds || (req.method === "DELETE" ? [req.path.split("/").filter(Boolean).at(-1)] : []);
+        for (const id of ids.filter(Boolean)) await pool.execute("DELETE FROM record_access WHERE module_name=? AND record_id=?",[context.permission,String(id)]);
+      })().catch((error) => console.error("No se pudo registrar la notificación:", error.message));
     }
   });
   next();
 });
 
 function requirePermission(permission) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const roleKey = ROLE_KEY_BY_NAME[req.role];
-    if (!roleKey || !PERMISSIONS[permission]?.includes(roleKey)) {
+    if (roleKey && PERMISSIONS[permission]?.includes(roleKey)) return next();
+    try {
+      const [assigned] = await pool.execute("SELECT 1 FROM record_access WHERE module_name=? AND username=? LIMIT 1",[permission,req.username]);
+      if (assigned.length) return next();
       return res.status(403).json({ error: "No tienes permiso para acceder a este recurso." });
+    } catch (error) {
+      return res.status(500).json({ error:"No se pudo validar el acceso.",details:error.message });
     }
-    next();
   };
 }
 
@@ -949,9 +1076,19 @@ app.post('/api/auth/logout', async (req, res) => {
   }
 });
 
+app.get("/api/access/modules", requireAuth, async (req,res) => {
+  try {
+    const [rows] = await pool.execute("SELECT DISTINCT module_name FROM record_access WHERE username=?",[req.username]);
+    res.json({ modules:rows.map((row) => row.module_name) });
+  } catch (err) {
+    res.status(500).json({ error:"No se pudieron cargar los accesos asignados.",details:err.message });
+  }
+});
+
 // Module-level authorization. Route handlers keep their existing authentication
 // middleware so the current auth flow remains unchanged.
 app.use("/api/users", requireAuth, requirePermission("users"));
+app.use("/api/users-trash", requireAuth, requirePermission("users"));
 app.use("/api/settings", requireAuth, requirePermission("settings"));
 app.use("/api/kanban", requireAuth, requirePermission("kanban"));
 app.use("/api/clients", requireAuth, requirePermission("clients"));
@@ -962,6 +1099,11 @@ app.use("/api/invoices", requireAuth, requirePermission("billing"));
 app.use("/api/module-data/:module", requireAuth, requireModulePermission);
 app.use("/api/reports", requireAuth, requirePermission("reports"));
 app.use("/api/notifications", requireAuth);
+app.use((req,res,next) => {
+  const protectedDelete = req.method === "DELETE" && notificationContext(req);
+  if (protectedDelete && req.role !== "Admin General") return res.status(403).json({ error:"Solo Admin General puede eliminar registros." });
+  next();
+});
 
 app.get("/api/notifications", async (req, res) => {
   try {
@@ -1089,15 +1231,15 @@ const DEFAULT_SETTINGS = {companyName:"Designs Agency S.A. de C.V.",rfc:"DAG2401
 app.get("/api/settings", requireAuth, async (_req,res)=>{try{const [rows]=await pool.execute("SELECT data FROM settings WHERE id=1");const data=rows.length?rows[0].data:null;res.json({settings:data?(typeof data==="string"?JSON.parse(data):data):DEFAULT_SETTINGS});}catch(err){res.status(500).json({error:"No se pudo cargar la configuración.",details:err.message});}});
 app.put("/api/settings", requireAuth, async (req,res)=>{if(req.role!=="Admin General")return res.status(403).json({error:"Solo Admin General puede modificar la configuración."});const settings={...DEFAULT_SETTINGS,...req.body,sessionTimeout:Math.max(5,Math.min(60,Number(req.body.sessionTimeout)||10))};try{await pool.execute("INSERT INTO settings (id,data) VALUES (1,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[JSON.stringify(settings)]);res.json({success:true,settings});}catch(err){res.status(500).json({error:"No se pudo guardar la configuración.",details:err.message});}});
 
-app.get("/api/kanban", requireAuth, async (_req,res)=>{try{const [rows]=await pool.execute("SELECT id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date AS dueDate FROM kanban_cards ORDER BY created_at");res.json({cards:rows.map(r=>({...r,tags:typeof r.tags==='string'?JSON.parse(r.tags):r.tags}))});}catch(err){res.status(500).json({error:"No se pudo cargar el tablero.",details:err.message});}});
-app.post("/api/kanban", requireAuth, async (req,res)=>{const {board,stage,title,subtitle,priority,tags,progress,assignee,dueDate}=req.body;if(!board||!stage||!title)return res.status(400).json({error:"Tablero, etapa y título son obligatorios."});const id=`kan_${Date.now()}`;try{await pool.execute("INSERT INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,?,?,?,?,?,?,?,?,?)",[id,board,stage,title,subtitle||'',priority||'Media',JSON.stringify(Array.isArray(tags)?tags:[]),progress??null,assignee||'D',dueDate||'']);res.status(201).json({success:true,id});}catch(err){res.status(500).json({error:"No se pudo crear la tarjeta.",details:err.message});}});
-app.put("/api/kanban/:id", requireAuth, async (req,res)=>{const allowed=['board','stage','title','subtitle','priority','progress','assignee'],sets=[],values=[];for(const key of allowed)if(req.body[key]!==undefined){sets.push(`\`${key}\`=?`);values.push(req.body[key]);}if(req.body.tags!==undefined){sets.push('tags=?');values.push(JSON.stringify(req.body.tags));}if(req.body.dueDate!==undefined){sets.push('due_date=?');values.push(req.body.dueDate);}if(!sets.length)return res.status(400).json({error:'No hay cambios.'});values.push(req.params.id);try{await pool.execute(`UPDATE kanban_cards SET ${sets.join(',')} WHERE id=?`,values);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo mover o actualizar la tarjeta.",details:err.message});}});
+app.get("/api/kanban", requireAuth, async (req,res)=>{try{const params=[];const where=req.role==="Admin General"?"":`WHERE ${accessSql("kanban")}`;if(where)params.push(req.username);const [rows]=await pool.execute(`SELECT id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date AS dueDate FROM kanban_cards ${where} ORDER BY created_at`,params);res.json({cards:rows.map(r=>({...r,tags:typeof r.tags==='string'?JSON.parse(r.tags):r.tags}))});}catch(err){res.status(500).json({error:"No se pudo cargar el tablero.",details:err.message});}});
+app.post("/api/kanban", requireAuth, async (req,res)=>{const {board,stage,title,subtitle,priority,tags,progress,assignee,dueDate}=req.body;if(!board||!stage||!title)return res.status(400).json({error:"Tablero, etapa y título son obligatorios."});const id=`kan_${Date.now()}`;try{await pool.execute("INSERT INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,?,?,?,?,?,?,?,?,?)",[id,board,stage,title,subtitle||'',priority||'Media',JSON.stringify(Array.isArray(tags)?tags:[]),progress??null,assignee||'D',dueDate||'']);await syncRecordAccess("kanban",id,req.username,req.body,false);req.auditRecordId=id;res.status(201).json({success:true,id});}catch(err){res.status(500).json({error:"No se pudo crear la tarjeta.",details:err.message});}});
+app.put("/api/kanban/:id", requireAuth, async (req,res)=>{const allowed=['board','stage','title','subtitle','priority','progress','assignee'],sets=[],values=[];for(const key of allowed)if(req.body[key]!==undefined){sets.push(`\`${key}\`=?`);values.push(req.body[key]);}if(req.body.tags!==undefined){sets.push('tags=?');values.push(JSON.stringify(req.body.tags));}if(req.body.dueDate!==undefined){sets.push('due_date=?');values.push(req.body.dueDate);}if(!sets.length)return res.status(400).json({error:'No hay cambios.'});if(!await userCanAccessRecord(req,"kanban",req.params.id))return res.status(403).json({error:"No tienes acceso a esta tarjeta."});values.push(req.params.id);try{await pool.execute(`UPDATE kanban_cards SET ${sets.join(',')} WHERE id=?`,values);await syncRecordAccess("kanban",req.params.id,req.username,req.body);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo mover o actualizar la tarjeta.",details:err.message});}});
 app.delete("/api/kanban/:id", requireAuth, async (req,res)=>{try{await pool.execute("DELETE FROM kanban_cards WHERE id=?",[req.params.id]);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo eliminar la tarjeta.",details:err.message});}});
 
 // ====================================================================
 // ENDPOINTS DE CLIENTES
 // ====================================================================
-app.get("/api/clients", requireAuth, async (_req, res) => {
+app.get("/api/clients", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.execute(
       `SELECT
@@ -1114,7 +1256,9 @@ app.get("/api/clients", requireAuth, async (_req, res) => {
         avatar_bg AS avatarBg,
         created_at AS createdAt
       FROM clients
+      ${req.role === "Admin General" ? "" : `WHERE ${accessSql("clients")}`}
       ORDER BY created_at DESC`
+      , req.role === "Admin General" ? [] : [req.username]
     );
 
     res.json({ clients: rows });
@@ -1150,6 +1294,8 @@ app.post("/api/clients", requireAuth, async (req, res) => {
         client.avatarBg
       ]
     );
+    await syncRecordAccess("clients",clientId,req.username,req.body,false);
+    req.auditRecordId = clientId;
 
     res.status(201).json({
       success: true,
@@ -1168,6 +1314,7 @@ app.put("/api/clients/:id", requireAuth, async (req, res) => {
   const clientId = req.params.id;
 
   try {
+    if (!await userCanAccessRecord(req,"clients",clientId)) return res.status(403).json({ error:"No tienes acceso a este cliente." });
     const [existingRows] = await pool.execute(
       `SELECT
         id,
@@ -1215,6 +1362,7 @@ app.put("/api/clients/:id", requireAuth, async (req, res) => {
         clientId
       ]
     );
+    await syncRecordAccess("clients",clientId,req.username,req.body);
 
     res.json({
       success: true,
@@ -1251,11 +1399,12 @@ app.delete("/api/clients/:id", requireAuth, async (req, res) => {
 // Obtener Proyectos del Usuario Conectado
 app.get("/api/projects", requireAuth, async (req, res) => {
   try {
+    const where = req.role === "Admin General" ? "" : `WHERE ${accessSql("projects")}`;
     const [rows] = await pool.execute(
-      "SELECT id, name, description, figma_node as figmaNode, tailwind_classes as tailwindClasses, component_code as componentCode, created_at as createdAt FROM projects WHERE username = ? ORDER BY created_at DESC",
-      [req.username]
+      `SELECT id,name,client_name AS clientName,description,figma_node AS figmaNode,tailwind_classes AS tailwindClasses,component_code AS componentCode,status,due_date AS dueDate,budget,manager,devs,start_date AS startDate,progress,priority,created_at AS createdAt FROM projects ${where} ORDER BY created_at DESC`,
+      req.role === "Admin General" ? [] : [req.username]
     );
-    res.json({ projects: rows });
+    res.json({ projects: rows.map((project) => ({...project,devs:typeof project.devs === "string" ? JSON.parse(project.devs) : (project.devs || [])})) });
   } catch (err) {
     res.status(500).json({ error: "Error al obtener proyectos de MySQL.", details: err.message });
   }
@@ -1263,7 +1412,7 @@ app.get("/api/projects", requireAuth, async (req, res) => {
 
 // Crear o Guardar un Proyecto en MySQL
 app.post("/api/projects", requireAuth, async (req, res) => {
-  const { name, description, figmaNode, tailwindClasses, componentCode } = req.body;
+  const { name,clientName,description,figmaNode,tailwindClasses,componentCode,status,dueDate,budget,manager,devs,startDate,progress,priority } = req.body;
 
   if (!name) {
     return res.status(400).json({ error: "El nombre del proyecto es obligatorio." });
@@ -1274,18 +1423,29 @@ app.post("/api/projects", requireAuth, async (req, res) => {
 
   try {
     await pool.execute(
-      "INSERT INTO projects (id, name, description, figma_node, tailwind_classes, component_code, username, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO projects (id,name,client_name,description,figma_node,tailwind_classes,component_code,status,due_date,budget,manager,devs,start_date,progress,priority,username,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
       [
         newId,
         name,
+        clientName || "",
         description || "",
         figmaNode || "",
         tailwindClasses || "",
         componentCode || "",
+        status || "En Boceto",
+        dueDate || null,
+        Number(budget) || 0,
+        manager || "",
+        JSON.stringify(Array.isArray(devs) ? devs : []),
+        startDate || null,
+        Number(progress) || 0,
+        priority || "Media",
         req.username,
         dateIso.slice(0, 19).replace('T', ' ') // Formatear para tipo TIMESTAMP de MySQL
       ]
     );
+    await syncRecordAccess("projects",newId,req.username,req.body,false);
+    req.auditRecordId = newId;
 
     res.json({
       success: true,
@@ -1307,27 +1467,37 @@ app.post("/api/projects", requireAuth, async (req, res) => {
 
 app.put("/api/projects/:id", requireAuth, async (req, res) => {
   const projectId = req.params.id;
-  const { name, description, figmaNode, tailwindClasses, componentCode } = req.body;
+  const { name,clientName,description,figmaNode,tailwindClasses,componentCode,status,dueDate,budget,manager,devs,startDate,progress,priority } = req.body;
 
   if (!name) {
     return res.status(400).json({ error: "El nombre del proyecto es obligatorio." });
   }
 
   try {
+    if (!await userCanAccessRecord(req,"projects",projectId)) return res.status(403).json({ error:"No tienes acceso a este proyecto." });
     const [result] = await pool.execute(
       `UPDATE projects
-       SET name = ?, description = ?, figma_node = ?, tailwind_classes = ?, component_code = ?
-       WHERE id = ? AND username = ?`,
+       SET name=?,client_name=?,description=?,figma_node=?,tailwind_classes=?,component_code=?,status=?,due_date=?,budget=?,manager=?,devs=?,start_date=?,progress=?,priority=?
+       WHERE id = ?`,
       [
         name,
+        clientName || "",
         description || "",
         figmaNode || "",
         tailwindClasses || "",
         componentCode || "",
-        projectId,
-        req.username
+        status || "En Boceto",
+        dueDate || null,
+        Number(budget) || 0,
+        manager || "",
+        JSON.stringify(Array.isArray(devs) ? devs : []),
+        startDate || null,
+        Number(progress) || 0,
+        priority || "Media",
+        projectId
       ]
     );
+    await syncRecordAccess("projects",projectId,req.username,req.body);
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: "Proyecto no encontrado o no pertenece a tu cuenta." });
@@ -1352,23 +1522,25 @@ app.put("/api/projects/:id", requireAuth, async (req, res) => {
 // Soporte PATCH para ediciones parciales desde el frontend (compatibilidad)
 app.patch("/api/projects/:id", requireAuth, async (req, res) => {
   const projectId = req.params.id;
-  const allowed = ["name", "description", "figma_node", "tailwind_classes", "component_code"];
+  const fieldMap = {name:"name",clientName:"client_name",description:"description",figmaNode:"figma_node",tailwindClasses:"tailwind_classes",componentCode:"component_code",status:"status",dueDate:"due_date",budget:"budget",manager:"manager",devs:"devs",startDate:"start_date",progress:"progress",priority:"priority"};
   const sets = [];
   const values = [];
 
-  for (const key of allowed) {
+  for (const [key,column] of Object.entries(fieldMap)) {
     if (req.body[key] !== undefined) {
-      sets.push(`\`${key.replace(/\w+/g, (m) => m)}\` = ?`);
-      values.push(req.body[key]);
+      sets.push(`\`${column}\` = ?`);
+      values.push(key === "devs" ? JSON.stringify(req.body[key]) : req.body[key]);
     }
   }
 
   if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
-  values.push(projectId, req.username);
+  values.push(projectId);
 
   try {
-    const [result] = await pool.execute(`UPDATE projects SET ${sets.join(", ")} WHERE id = ? AND username = ?`, values);
+    if (!await userCanAccessRecord(req,"projects",projectId)) return res.status(403).json({ error:"No tienes acceso a este proyecto." });
+    const [result] = await pool.execute(`UPDATE projects SET ${sets.join(", ")} WHERE id = ?`, values);
     if (result.affectedRows === 0) return res.status(404).json({ error: "Proyecto no encontrado o no pertenece a tu cuenta." });
+    await syncRecordAccess("projects",projectId,req.username,req.body);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "No se pudo actualizar el proyecto.", details: err.message });
@@ -1381,8 +1553,8 @@ app.delete("/api/projects/:id", requireAuth, async (req, res) => {
 
   try {
     const [result] = await pool.execute(
-      "DELETE FROM projects WHERE id = ? AND username = ?",
-      [projectId, req.username]
+      "DELETE FROM projects WHERE id = ?",
+      [projectId]
     );
 
     if (result.affectedRows === 0) {
@@ -1400,9 +1572,10 @@ app.delete("/api/projects/:id", requireAuth, async (req, res) => {
 // ====================================================================
 app.get("/api/web-projects", requireAuth, async (req, res) => {
   try {
+    const where = req.role === "Admin General" ? "" : `WHERE ${accessSql("projects_web")}`;
     const [rows] = await pool.execute(
-      `SELECT id, name, client_name AS clientName, manager, designer, builder, start_date AS startDate, due_date AS dueDate, progress, status, priority, description, created_at AS createdAt, updated_at AS updatedAt FROM web_projects WHERE username = ? ORDER BY created_at DESC`,
-      [req.username]
+      `SELECT id, name, client_name AS clientName, manager, designer, builder, start_date AS startDate, due_date AS dueDate, progress, status, priority, description, created_at AS createdAt, updated_at AS updatedAt FROM web_projects ${where} ORDER BY created_at DESC`,
+      req.role === "Admin General" ? [] : [req.username]
     );
     res.json({ projects: rows });
   } catch (err) {
@@ -1420,6 +1593,8 @@ app.post("/api/web-projects", requireAuth, async (req, res) => {
       `INSERT INTO web_projects (id, username, name, client_name, manager, designer, builder, start_date, due_date, progress, status, priority, description) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [id, req.username, name, clientName, manager || '', designer || '', builder || '', startDate || null, dueDate || null, progress ?? 0, status || 'Diseño inicial', priority || 'Media', description || '']
     );
+    await syncRecordAccess("projects_web",id,req.username,req.body,false);
+    req.auditRecordId = id;
 
     res.status(201).json({ success: true, project: { id, name, clientName, manager, designer, builder, startDate, dueDate, progress, status, priority, description, createdAt: new Date().toISOString() } });
   } catch (err) {
@@ -1442,11 +1617,13 @@ app.put("/api/web-projects/:id", requireAuth, async (req, res) => {
   }
 
   if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
-  values.push(projectId, req.username);
+  values.push(projectId);
 
   try {
-    const [result] = await pool.execute(`UPDATE web_projects SET ${sets.join(', ')} WHERE id = ? AND username = ?`, values);
+    if (!await userCanAccessRecord(req,"projects_web",projectId)) return res.status(403).json({ error:"No tienes acceso a este proyecto web." });
+    const [result] = await pool.execute(`UPDATE web_projects SET ${sets.join(', ')} WHERE id = ?`, values);
     if (result.affectedRows === 0) return res.status(404).json({ error: "Web project no encontrado o no pertenece a tu cuenta." });
+    await syncRecordAccess("projects_web",projectId,req.username,req.body);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "No se pudo actualizar el web project.", details: err.message });
@@ -1480,11 +1657,13 @@ app.patch("/api/web-projects/:id", requireAuth, async (req, res) => {
   }
 
   if (!sets.length) return res.status(400).json({ error: 'No hay cambios.' });
-  values.push(projectId, req.username);
+  values.push(projectId);
 
   try {
-    const [result] = await pool.execute(`UPDATE web_projects SET ${sets.join(', ')} WHERE id = ? AND username = ?`, values);
+    if (!await userCanAccessRecord(req,"projects_web",projectId)) return res.status(403).json({ error:"No tienes acceso a este proyecto web." });
+    const [result] = await pool.execute(`UPDATE web_projects SET ${sets.join(', ')} WHERE id = ?`, values);
     if (result.affectedRows === 0) return res.status(404).json({ error: 'Web project no encontrado o no pertenece a tu cuenta.' });
+    await syncRecordAccess("projects_web",projectId,req.username,req.body);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'No se pudo actualizar el web project.', details: err.message });
@@ -1493,7 +1672,7 @@ app.patch("/api/web-projects/:id", requireAuth, async (req, res) => {
 
 app.delete("/api/web-projects/:id", requireAuth, async (req, res) => {
   try {
-    const [result] = await pool.execute("DELETE FROM web_projects WHERE id = ? AND username = ?", [req.params.id, req.username]);
+    const [result] = await pool.execute("DELETE FROM web_projects WHERE id = ?", [req.params.id]);
     if (result.affectedRows === 0) return res.status(404).json({ error: "Web project no encontrado o no pertenece a tu cuenta." });
     res.json({ success: true, message: "Web project eliminado correctamente." });
   } catch (err) {
@@ -1501,7 +1680,7 @@ app.delete("/api/web-projects/:id", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/api/tasks", requireAuth, async (_req, res) => {
+app.get("/api/tasks", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.execute(
       `SELECT
@@ -1515,7 +1694,9 @@ app.get("/api/tasks", requireAuth, async (_req, res) => {
         assignee,
         created_at AS createdAt
       FROM tasks
+      ${req.role === "Admin General" ? "" : `WHERE ${accessSql("tasks")}`}
       ORDER BY created_at DESC`
+      , req.role === "Admin General" ? [] : [req.username]
     );
 
     res.json({ tasks: rows });
@@ -1559,6 +1740,8 @@ app.post("/api/tasks", requireAuth, async (req, res) => {
   const id = `t_${Date.now()}`;
   try {
     await pool.execute("INSERT INTO tasks (id,title,description,column_name,status,priority,project_name,assignee) VALUES (?,?,?,?,?,?,?,?)", [id,title.trim(),description,column,status,priority,projectName,assignee]);
+    await syncRecordAccess("tasks",id,req.username,req.body,false);
+    req.auditRecordId = id;
     res.status(201).json({ success: true, task: { id,title:title.trim(),description,column,columnName:column,status,priority,projectName,assignee,createdAt:new Date().toISOString() } });
     void sendPushToAssignee(assignee, { title: "Nueva tarea asignada", body: title.trim(), url: "/?view=tasks", tag: `task:${id}` });
   } catch (err) { res.status(500).json({ error: "No se pudo crear la tarea.", details: err.message }); }
@@ -1571,9 +1754,11 @@ app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
   if (!sets.length) return res.status(400).json({ error: "No hay cambios." });
   values.push(req.params.id);
   try {
+    if (!await userCanAccessRecord(req,"tasks",req.params.id)) return res.status(403).json({ error:"No tienes acceso a esta tarea." });
     const [beforeRows] = await pool.execute("SELECT title,status FROM tasks WHERE id=?", [req.params.id]);
     if (!beforeRows.length) return res.status(404).json({ error:"Tarea no encontrada." });
     await pool.execute(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`, values);
+    await syncRecordAccess("tasks",req.params.id,req.username,req.body);
     const taskTitle = req.body.title?.trim() || beforeRows[0].title;
     res.json({ success:true });
 
@@ -1595,7 +1780,7 @@ app.delete("/api/tasks/:id", requireAuth, async (req,res) => {
   catch(err){res.status(500).json({error:"No se pudo eliminar la tarea.",details:err.message});}
 });
 
-app.get("/api/invoices", requireAuth, async (_req, res) => {
+app.get("/api/invoices", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.execute(
       `SELECT
@@ -1610,7 +1795,9 @@ app.get("/api/invoices", requireAuth, async (_req, res) => {
         description,
         created_at AS createdAt
       FROM invoices
+      ${req.role === "Admin General" ? "" : `WHERE ${accessSql("billing")}`}
       ORDER BY created_at DESC`
+      , req.role === "Admin General" ? [] : [req.username]
     );
 
     res.json({ invoices: rows });
@@ -1623,7 +1810,7 @@ app.post("/api/invoices", requireAuth, async (req,res) => {
   const { clientName, amount, status="Pendiente", dueDate=null, paymentDate=null, paymentMethod=null, isInvoiced=false, description="" }=req.body;
   if(!clientName?.trim() || !Number.isFinite(Number(amount))) return res.status(400).json({error:"Cliente y monto son obligatorios."});
   const id=`inv_${Date.now()}`;
-  try { await pool.execute("INSERT INTO invoices (id,client_name,amount,status,due_date,payment_date,payment_method,is_invoiced,description) VALUES (?,?,?,?,?,?,?,?,?)",[id,clientName.trim(),Number(amount),status,dueDate||null,paymentDate||null,paymentMethod||null,isInvoiced?1:0,description]); res.status(201).json({success:true,invoice:{id,clientName:clientName.trim(),amount:Number(amount),status,dueDate:dueDate||"",paymentDate:paymentDate||"",paymentMethod:paymentMethod||"",isInvoiced:Boolean(isInvoiced),description}}); }
+  try { await pool.execute("INSERT INTO invoices (id,client_name,amount,status,due_date,payment_date,payment_method,is_invoiced,description) VALUES (?,?,?,?,?,?,?,?,?)",[id,clientName.trim(),Number(amount),status,dueDate||null,paymentDate||null,paymentMethod||null,isInvoiced?1:0,description]); await syncRecordAccess("billing",id,req.username,req.body,false); req.auditRecordId=id; res.status(201).json({success:true,invoice:{id,clientName:clientName.trim(),amount:Number(amount),status,dueDate:dueDate||"",paymentDate:paymentDate||"",paymentMethod:paymentMethod||"",isInvoiced:Boolean(isInvoiced),description}}); }
   catch(err){res.status(500).json({error:"No se pudo crear la factura.",details:err.message});}
 });
 
@@ -1631,7 +1818,7 @@ app.patch("/api/invoices/:id", requireAuth, async (req,res) => {
   const map={clientName:"client_name",amount:"amount",status:"status",dueDate:"due_date",paymentDate:"payment_date",paymentMethod:"payment_method",isInvoiced:"is_invoiced",description:"description"},sets=[],values=[];
   for(const [key,column] of Object.entries(map))if(req.body[key]!==undefined){sets.push(`\`${column}\`=?`);values.push(req.body[key]);}
   if(!sets.length)return res.status(400).json({error:"No hay cambios."}); values.push(req.params.id);
-  try{const [result]=await pool.execute(`UPDATE invoices SET ${sets.join(",")} WHERE id=?`,values);if(!result.affectedRows)return res.status(404).json({error:"Factura no encontrada."});res.json({success:true});}
+  try{if(!await userCanAccessRecord(req,"billing",req.params.id))return res.status(403).json({error:"No tienes acceso a este pago."});const [result]=await pool.execute(`UPDATE invoices SET ${sets.join(",")} WHERE id=?`,values);if(!result.affectedRows)return res.status(404).json({error:"Factura no encontrada."});await syncRecordAccess("billing",req.params.id,req.username,req.body);res.json({success:true});}
   catch(err){res.status(500).json({error:"No se pudo actualizar la factura.",details:err.message});}
 });
 
@@ -1643,7 +1830,12 @@ app.delete("/api/invoices/:id", requireAuth, async (req,res) => {
 const MODULE_NAMES = new Set(["leads","services","renewals","quotes","staff","credentials"]);
 app.get("/api/module-data/:module", requireAuth, async (req,res) => {
   if(!MODULE_NAMES.has(req.params.module))return res.status(404).json({error:"Módulo no válido."});
-  try{const [rows]=await pool.execute("SELECT data FROM module_data WHERE username=? AND module_name=?",[req.username,req.params.module]);const data=rows.length?(typeof rows[0].data==="string"?JSON.parse(rows[0].data):rows[0].data):null;res.json({data});}
+  try{
+    const where = req.role === "Admin General" ? "module_name=?" : `module_name=? AND ${accessSql(req.params.module,"record_id")}`;
+    const params = req.role === "Admin General" ? [req.params.module] : [req.params.module,req.username];
+    const [rows] = await pool.execute(`SELECT data FROM shared_module_records WHERE ${where} ORDER BY created_at`,params);
+    res.json({data:rows.map((row) => typeof row.data === "string" ? JSON.parse(row.data) : row.data)});
+  }
   catch(err){res.status(500).json({error:"No se pudo cargar el módulo.",details:err.message});}
 });
 
@@ -1651,10 +1843,13 @@ app.put("/api/module-data/:module", requireAuth, async (req,res) => {
   if(!MODULE_NAMES.has(req.params.module))return res.status(404).json({error:"Módulo no válido."});
   if(!Array.isArray(req.body.data))return res.status(400).json({error:"Los datos deben ser una lista."});
   try{
-    const [currentRows] = await pool.execute("SELECT data FROM module_data WHERE username=? AND module_name=? LIMIT 1", [req.username,req.params.module]);
-    const previous = currentRows.length ? (typeof currentRows[0].data === "string" ? JSON.parse(currentRows[0].data) : currentRows[0].data) : [];
+    const visibleWhere = req.role === "Admin General" ? "module_name=?" : `module_name=? AND ${accessSql(req.params.module,"record_id")}`;
+    const visibleParams = req.role === "Admin General" ? [req.params.module] : [req.params.module,req.username];
+    const [currentRows] = await pool.execute(`SELECT record_id AS id,data FROM shared_module_records WHERE ${visibleWhere}`,visibleParams);
+    const previous = currentRows.map((row) => typeof row.data === "string" ? JSON.parse(row.data) : row.data);
     const nextData = req.body.data;
-    const previousItems = Array.isArray(previous) ? previous : [];
+    if (nextData.some((item) => !item?.id)) return res.status(400).json({error:"Todos los registros deben tener identificador."});
+    const previousItems = previous;
     const previousById = new Map(previousItems.map((item) => [String(item?.id),item]));
     const nextById = new Map(nextData.map((item) => [String(item?.id),item]));
     const added = nextData.filter((item) => !previousById.has(String(item?.id)));
@@ -1663,29 +1858,50 @@ app.put("/api/module-data/:module", requireAuth, async (req,res) => {
       const oldItem = previousById.get(String(item?.id));
       return oldItem && JSON.stringify(oldItem) !== JSON.stringify(item);
     });
+    if (removed.length && req.role !== "Admin General") return res.status(403).json({error:"Solo Admin General puede eliminar registros."});
+    for (const item of nextData) {
+      const id = String(item.id);
+      const [exists] = await pool.execute("SELECT 1 FROM shared_module_records WHERE module_name=? AND record_id=?",[req.params.module,id]);
+      if (exists.length) {
+        if (!await userCanAccessRecord(req,req.params.module,id)) return res.status(403).json({error:"No tienes acceso a uno de los registros."});
+        await pool.execute("UPDATE shared_module_records SET data=? WHERE module_name=? AND record_id=?",[JSON.stringify(item),req.params.module,id]);
+        await syncRecordAccess(req.params.module,id,req.username,item);
+      } else {
+        await pool.execute("INSERT INTO shared_module_records (module_name,record_id,owner_username,data) VALUES (?,?,?,?)",[req.params.module,id,req.username,JSON.stringify(item)]);
+        await syncRecordAccess(req.params.module,id,req.username,item,false);
+      }
+    }
+    for (const item of removed) {
+      await pool.execute("DELETE FROM shared_module_records WHERE module_name=? AND record_id=?",[req.params.module,String(item.id)]);
+    }
+    if (removed.length) req.auditRecordIds = removed.map((item) => String(item.id));
     const affected = added[0] || removed[0] || changed[0];
     if (affected) {
+      req.auditRecordId = String(affected.id);
       req.auditEntity = affected.folio || affected.title || affected.name || affected.clientName || affected.companyName || affected.concept || affected.id;
       req.auditAction = added.length ? "creó" : removed.length ? "eliminó" : "actualizó";
     } else req.skipAudit = true;
-    await pool.execute("INSERT INTO module_data (username,module_name,data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[req.username,req.params.module,JSON.stringify(nextData)]);
     res.json({success:true});
   }
   catch(err){res.status(500).json({error:"No se pudo guardar el módulo.",details:err.message});}
 });
 
-app.get("/api/reports/summary", requireAuth, async (_req, res) => {
+app.get("/api/reports/summary", requireAuth, async (req, res) => {
   try {
+    const invoiceAccess = req.role === "Admin General" ? "" : `AND ${accessSql("billing","i.id")}`;
+    const projectAccess = req.role === "Admin General" ? "" : `WHERE ${accessSql("projects","p.id")}`;
+    const invoiceParams = req.role === "Admin General" ? [] : [req.username];
+    const projectParams = req.role === "Admin General" ? [] : [req.username];
     const [[invoiceTotals], [activeProjects], [monthlyRows], [managerRows]] = await Promise.all([
       pool.execute(`SELECT
         COALESCE(SUM(CASE WHEN status = 'Pagado' AND YEAR(due_date)=YEAR(CURDATE()) AND MONTH(due_date)=MONTH(CURDATE()) THEN amount ELSE 0 END),0) monthlyIncome,
         COALESCE(SUM(CASE WHEN status IN ('Pendiente','Vencido') THEN amount ELSE 0 END),0) pendingPayments
-        FROM invoices`),
-      pool.execute("SELECT COUNT(*) activeProjects FROM projects"),
-      pool.execute(`SELECT DATE_FORMAT(due_date,'%Y-%m') monthKey, SUM(amount) total FROM invoices WHERE status='Pagado' AND due_date >= DATE_SUB(CURDATE(), INTERVAL 5 MONTH) GROUP BY monthKey`),
+        FROM invoices i WHERE 1=1 ${invoiceAccess}`,invoiceParams),
+      pool.execute(`SELECT COUNT(*) activeProjects FROM projects p ${projectAccess}`,projectParams),
+      pool.execute(`SELECT DATE_FORMAT(due_date,'%Y-%m') monthKey, SUM(amount) total FROM invoices i WHERE status='Pagado' AND due_date >= DATE_SUB(CURDATE(), INTERVAL 5 MONTH) ${invoiceAccess} GROUP BY monthKey`,invoiceParams),
       pool.execute(`SELECT COALESCE(NULLIF(c.responsible,''),p.username) manager, SUM(i.amount) total
         FROM invoices i LEFT JOIN clients c ON c.company_name=i.client_name LEFT JOIN projects p ON p.username=LOWER(SUBSTRING_INDEX(c.responsible,' ',1))
-        WHERE i.status='Pagado' GROUP BY manager ORDER BY total DESC LIMIT 4`)
+        WHERE i.status='Pagado' ${invoiceAccess} GROUP BY manager ORDER BY total DESC LIMIT 4`,invoiceParams)
     ]);
     const months=[]; const formatter=new Intl.DateTimeFormat('es-MX',{month:'short'}); const byMonth=Object.fromEntries(monthlyRows.map(r=>[r.monthKey,Number(r.total)]));
     for(let offset=5;offset>=0;offset--){const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-offset);const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;months.push({label:formatter.format(d).replace('.','').replace(/^./,x=>x.toUpperCase()),value:byMonth[key]||0});}

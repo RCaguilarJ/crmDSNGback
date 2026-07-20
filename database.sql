@@ -86,6 +86,27 @@ CREATE TABLE IF NOT EXISTS `notifications` (
   INDEX `idx_notifications_unread` (`recipient_username`, `read_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `record_access` (
+  `module_name` VARCHAR(50) NOT NULL,
+  `record_id` VARCHAR(100) NOT NULL,
+  `username` VARCHAR(50) NOT NULL,
+  `is_owner` TINYINT(1) NOT NULL DEFAULT 0,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`module_name`,`record_id`,`username`),
+  INDEX `idx_record_access_user` (`username`,`module_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `shared_module_records` (
+  `module_name` VARCHAR(50) NOT NULL,
+  `record_id` VARCHAR(100) NOT NULL,
+  `owner_username` VARCHAR(50) NOT NULL,
+  `data` JSON NOT NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`module_name`,`record_id`),
+  INDEX `idx_shared_module_owner` (`owner_username`,`module_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- --------------------------------------------------------------------
 -- 3. TABLA DE CLIENTES
 -- --------------------------------------------------------------------
@@ -111,6 +132,15 @@ CREATE TABLE IF NOT EXISTS `projects` (
   `id` VARCHAR(50) NOT NULL PRIMARY KEY,
   `name` VARCHAR(150) NOT NULL,
   `description` TEXT DEFAULT NULL,
+  `client_name` VARCHAR(150) DEFAULT NULL,
+  `status` VARCHAR(40) DEFAULT NULL,
+  `due_date` DATE DEFAULT NULL,
+  `budget` DECIMAL(12,2) DEFAULT NULL,
+  `manager` VARCHAR(120) DEFAULT NULL,
+  `devs` JSON DEFAULT NULL,
+  `start_date` DATE DEFAULT NULL,
+  `progress` INT DEFAULT NULL,
+  `priority` VARCHAR(20) DEFAULT NULL,
   `figma_node` VARCHAR(100) DEFAULT NULL,
   `tailwind_classes` TEXT DEFAULT NULL,
   `component_code` MEDIUMTEXT DEFAULT NULL,
