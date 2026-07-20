@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS `push_deliveries` (
   FOREIGN KEY (`subscription_id`) REFERENCES `push_subscriptions` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `notifications` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `recipient_username` VARCHAR(50) NOT NULL,
+  `actor_username` VARCHAR(50) NOT NULL,
+  `module_name` VARCHAR(50) NOT NULL,
+  `target_view` VARCHAR(50) NOT NULL,
+  `title` VARCHAR(180) NOT NULL,
+  `message` VARCHAR(500) NOT NULL,
+  `entity_id` VARCHAR(100) DEFAULT NULL,
+  `read_at` TIMESTAMP NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_notifications_recipient` (`recipient_username`, `created_at`),
+  INDEX `idx_notifications_unread` (`recipient_username`, `read_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- --------------------------------------------------------------------
 -- 3. TABLA DE CLIENTES
 -- --------------------------------------------------------------------

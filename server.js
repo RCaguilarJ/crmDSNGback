@@ -86,7 +86,7 @@ const corsOptions = {
     return callback(new Error(`Origen no permitido por CORS: ${origin}`));
   },
   credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 };
 
@@ -144,6 +144,7 @@ const pool = mysql.createPool({
     await ensureTaskStatusColumn();
     await ensureInvoiceColumns();
     await ensurePushSchema();
+    await ensureNotificationsSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
       await ensureLocalSeedUsers();
       console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
@@ -296,6 +297,23 @@ async function ensurePushSchema() {
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 }
 
+async function ensureNotificationsSchema() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS notifications (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    recipient_username VARCHAR(50) NOT NULL,
+    actor_username VARCHAR(50) NOT NULL,
+    module_name VARCHAR(50) NOT NULL,
+    target_view VARCHAR(50) NOT NULL,
+    title VARCHAR(180) NOT NULL,
+    message VARCHAR(500) NOT NULL,
+    entity_id VARCHAR(100) NULL,
+    read_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_notifications_recipient (recipient_username, created_at),
+    INDEX idx_notifications_unread (recipient_username, read_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+
 function pushSubscriptionId(endpoint) {
   return crypto.createHash("sha256").update(endpoint).digest("hex");
 }
@@ -331,18 +349,6 @@ async function sendPushToAssignee(assignee, payload) {
       WHERE LOWER(?) IN (LOWER(u.username), LOWER(u.name))
          OR LOWER(u.name) LIKE CONCAT(LOWER(?), '%')`,
     [assignee, assignee]
-  );
-  await sendPushToRows(rows, payload);
-}
-
-async function sendPushToOtherUsers(actorUsername, payload) {
-  if (!PUSH_ENABLED || !actorUsername) return;
-  const [rows] = await pool.execute(
-    `SELECT ps.id,ps.endpoint,ps.p256dh,ps.auth
-       FROM push_subscriptions ps
-       JOIN users u ON u.username=ps.username
-      WHERE ps.username<>? AND u.status='Activo'`,
-    [actorUsername]
   );
   await sendPushToRows(rows, payload);
 }
@@ -549,6 +555,100 @@ const PERMISSIONS = {
   users: ["admin_general"],
   settings: ["admin_general"]
 };
+
+const NOTIFICATION_MODULES = {
+  clients: { permission:"clients", view:"clients", singular:"cliente" },
+  projects: { permission:"projects", view:"projects", singular:"proyecto de desarrollo" },
+  "web-projects": { permission:"projects_web", view:"projects_web", singular:"proyecto web" },
+  kanban: { permission:"kanban", view:"kanban", singular:"tarjeta Kanban" },
+  tasks: { permission:"tasks", view:"tasks", singular:"tarea" },
+  invoices: { permission:"billing", view:"billing", singular:"registro de pago" },
+  users: { permission:"users", view:"users", singular:"usuario" },
+  "users-trash": { permission:"users", view:"users", singular:"usuario de la papelera" },
+  settings: { permission:"settings", view:"settings", singular:"configuración" },
+  leads: { permission:"leads", view:"leads", singular:"prospecto" },
+  services: { permission:"services", view:"services", singular:"servicio" },
+  renewals: { permission:"renewals", view:"renewals", singular:"renovación" },
+  quotes: { permission:"quotes", view:"quotes", singular:"cotización" },
+  staff: { permission:"staff", view:"staff", singular:"registro de personal" },
+  credentials: { permission:"credentials", view:"credentials", singular:"registro de credenciales" }
+};
+
+function notificationContext(req) {
+  const parts = req.path.split("/").filter(Boolean);
+  if (parts[0] !== "api") return null;
+  if (parts[1] === "module-data") {
+    const moduleName = parts[2];
+    return NOTIFICATION_MODULES[moduleName] ? { ...NOTIFICATION_MODULES[moduleName], moduleName } : null;
+  }
+  const moduleName = parts[1];
+  return NOTIFICATION_MODULES[moduleName] ? { ...NOTIFICATION_MODULES[moduleName], moduleName } : null;
+}
+
+function notificationEntity(req) {
+  if (req.auditEntity) return String(req.auditEntity).slice(0, 140);
+  const body = req.body || {};
+  const value = body.title || body.name || body.companyName || body.clientName || body.projectName || body.folio || body.username;
+  if (typeof value === "string" && value.trim()) return value.trim().slice(0, 140);
+  const parts = req.path.split("/").filter(Boolean);
+  if (parts[1] === "module-data") return null;
+  const id = parts.at(-1);
+  return id && !["api","settings", "module-data"].includes(id) ? id.slice(0, 100) : null;
+}
+
+function notificationAction(req) {
+  if (req.auditAction) return req.auditAction;
+  if (req.path.includes("/restore")) return "restauró";
+  if (req.method === "DELETE") return "eliminó";
+  if (req.method === "POST") return "creó";
+  if (req.body?.status !== undefined) return `cambió el estado a “${String(req.body.status).slice(0, 60)}” en`;
+  return "actualizó";
+}
+
+async function createPlatformNotification(req) {
+  if (req.skipAudit) return;
+  const context = notificationContext(req);
+  if (!context || !req.username) return;
+  const allowedRoles = PERMISSIONS[context.permission] || [];
+  if (!allowedRoles.length) return;
+  const [actorRows] = await pool.execute("SELECT name FROM users WHERE username=? LIMIT 1", [req.username]);
+  const actorName = actorRows[0]?.name || req.username;
+  const [users] = await pool.execute("SELECT username,role FROM users WHERE status='Activo' AND username<>?", [req.username]);
+  const recipients = users.filter((user) => allowedRoles.includes(ROLE_KEY_BY_NAME[user.role]));
+  if (!recipients.length) return;
+  const entity = notificationEntity(req);
+  const action = notificationAction(req);
+  const target = entity ? `${context.singular} “${entity}”` : context.singular;
+  const title = `Cambio en ${context.view === "projects_web" ? "Proyectos web" : context.singular}`;
+  const message = `${actorName} ${action} ${target}.`;
+  const values = recipients.map((user) => [user.username, req.username, context.permission, context.view, title, message, entity]);
+  await pool.query(
+    "INSERT INTO notifications (recipient_username,actor_username,module_name,target_view,title,message,entity_id) VALUES ?",
+    [values]
+  );
+  const recipientNames = recipients.map((user) => user.username);
+  const [subscriptions] = await pool.query(
+    "SELECT id,endpoint,p256dh,auth FROM push_subscriptions WHERE username IN (?)",
+    [recipientNames]
+  );
+  await sendPushToRows(subscriptions, {
+    title,
+    body:message,
+    url:`/?view=${context.view}`,
+    tag:`change:${context.permission}:${Date.now()}`
+  });
+}
+
+app.use((req, res, next) => {
+  const mutating = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method);
+  if (!mutating) return next();
+  res.on("finish", () => {
+    if (res.statusCode < 400 && req.username && notificationContext(req)) {
+      void createPlatformNotification(req).catch((error) => console.error("No se pudo registrar la notificación:", error.message));
+    }
+  });
+  next();
+});
 
 function requirePermission(permission) {
   return (req, res, next) => {
@@ -861,6 +961,43 @@ app.use("/api/tasks", requireAuth, requirePermission("tasks"));
 app.use("/api/invoices", requireAuth, requirePermission("billing"));
 app.use("/api/module-data/:module", requireAuth, requireModulePermission);
 app.use("/api/reports", requireAuth, requirePermission("reports"));
+app.use("/api/notifications", requireAuth);
+
+app.get("/api/notifications", async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT id,title,message,target_view AS view,module_name AS moduleName,
+              actor_username AS actorUsername,entity_id AS entityId,
+              read_at AS readAt,created_at AS createdAt
+         FROM notifications
+        WHERE recipient_username=?
+        ORDER BY created_at DESC
+        LIMIT 100`,
+      [req.username]
+    );
+    res.json({ notifications:rows });
+  } catch (err) {
+    res.status(500).json({ error:"No se pudieron cargar las notificaciones.",details:err.message });
+  }
+});
+
+app.patch("/api/notifications/:id/read", async (req, res) => {
+  try {
+    await pool.execute("UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP) WHERE id=? AND recipient_username=?", [req.params.id,req.username]);
+    res.json({ success:true });
+  } catch (err) {
+    res.status(500).json({ error:"No se pudo marcar la notificación.",details:err.message });
+  }
+});
+
+app.post("/api/notifications/read-all", async (req, res) => {
+  try {
+    await pool.execute("UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP) WHERE recipient_username=?", [req.username]);
+    res.json({ success:true });
+  } catch (err) {
+    res.status(500).json({ error:"No se pudieron marcar las notificaciones.",details:err.message });
+  }
+});
 
 app.get("/api/users", requireAuth, async (_req, res) => {
   try {
@@ -1448,14 +1585,6 @@ app.patch("/api/tasks/:id", requireAuth, async (req, res) => {
         tag:`task:${req.params.id}:${Date.now()}`
       }).catch((error) => console.error("No se pudo notificar la asignación:", error.message));
     }
-    if (req.body.status !== undefined && req.body.status !== beforeRows[0].status) {
-      void sendPushToOtherUsers(req.username, {
-        title:"Estado de tarea actualizado",
-        body:`${taskTitle}: ${beforeRows[0].status} → ${req.body.status}`,
-        url:"/?view=tasks",
-        tag:`task-status:${req.params.id}:${Date.now()}`
-      }).catch((error) => console.error("No se pudo notificar el cambio de estado:", error.message));
-    }
   } catch(err) {
     res.status(500).json({ error:"No se pudo actualizar la tarea.",details:err.message });
   }
@@ -1521,7 +1650,27 @@ app.get("/api/module-data/:module", requireAuth, async (req,res) => {
 app.put("/api/module-data/:module", requireAuth, async (req,res) => {
   if(!MODULE_NAMES.has(req.params.module))return res.status(404).json({error:"Módulo no válido."});
   if(!Array.isArray(req.body.data))return res.status(400).json({error:"Los datos deben ser una lista."});
-  try{await pool.execute("INSERT INTO module_data (username,module_name,data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[req.username,req.params.module,JSON.stringify(req.body.data)]);res.json({success:true});}
+  try{
+    const [currentRows] = await pool.execute("SELECT data FROM module_data WHERE username=? AND module_name=? LIMIT 1", [req.username,req.params.module]);
+    const previous = currentRows.length ? (typeof currentRows[0].data === "string" ? JSON.parse(currentRows[0].data) : currentRows[0].data) : [];
+    const nextData = req.body.data;
+    const previousItems = Array.isArray(previous) ? previous : [];
+    const previousById = new Map(previousItems.map((item) => [String(item?.id),item]));
+    const nextById = new Map(nextData.map((item) => [String(item?.id),item]));
+    const added = nextData.filter((item) => !previousById.has(String(item?.id)));
+    const removed = previousItems.filter((item) => !nextById.has(String(item?.id)));
+    const changed = nextData.filter((item) => {
+      const oldItem = previousById.get(String(item?.id));
+      return oldItem && JSON.stringify(oldItem) !== JSON.stringify(item);
+    });
+    const affected = added[0] || removed[0] || changed[0];
+    if (affected) {
+      req.auditEntity = affected.folio || affected.title || affected.name || affected.clientName || affected.companyName || affected.concept || affected.id;
+      req.auditAction = added.length ? "creó" : removed.length ? "eliminó" : "actualizó";
+    } else req.skipAudit = true;
+    await pool.execute("INSERT INTO module_data (username,module_name,data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[req.username,req.params.module,JSON.stringify(nextData)]);
+    res.json({success:true});
+  }
   catch(err){res.status(500).json({error:"No se pudo guardar el módulo.",details:err.message});}
 });
 

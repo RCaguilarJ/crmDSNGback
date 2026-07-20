@@ -28,6 +28,8 @@ La clave pública se entrega al navegador. La clave privada debe permanecer úni
 - La suscripción de cada navegador se guarda en `push_subscriptions`.
 - Crear o reasignar una tarea envía un aviso al responsable.
 - Cambiar el estado de una tarea avisa a todos los usuarios suscritos, excepto a quien realizó el cambio.
+- Las altas, ediciones y eliminaciones se guardan también en la campana interna del CRM.
+- Cada aviso se entrega únicamente a usuarios cuyo rol tiene permiso para abrir el módulo afectado.
 - El backend revisa vencimientos al iniciar y cada seis horas.
 - `push_deliveries` impide repetir una alerta de vencimiento en el mismo dispositivo.
 - Las suscripciones expiradas se eliminan automáticamente.
