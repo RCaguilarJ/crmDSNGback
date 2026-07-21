@@ -51,6 +51,8 @@ if (!process.env.JWT_SECRET) {
   console.warn("⚠️ JWT_SECRET no configurado: se usará una clave efímera solo para desarrollo.");
 }
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1h";
+const JWT_VERIFY_OPTIONS = { algorithms:["HS256"], issuer:"designs-crm", audience:"designs-crm-web" };
+const createAccessToken = (username,role) => jwt.sign({ username,role },JWT_SECRET,{ expiresIn:JWT_EXPIRES_IN,algorithm:"HS256",issuer:JWT_VERIFY_OPTIONS.issuer,audience:JWT_VERIFY_OPTIONS.audience });
 const PUSH_ENABLED = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT);
 if (PUSH_ENABLED) {
   webpush.setVapidDetails(process.env.VAPID_SUBJECT, process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
@@ -60,6 +62,7 @@ if (PUSH_ENABLED) {
 
 const app = express();
 app.disable("x-powered-by");
+if (process.env.TRUST_PROXY_HOPS) app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS));
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
 const LOCAL_SEED_PASSWORD = "demo";
@@ -72,6 +75,9 @@ const LOCAL_SEED_USERS = [
 ];
 
 const allowedOrigins = CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean);
+if (IS_PRODUCTION && process.env.ALLOW_CORS_WILDCARD === "true") {
+  throw new Error("ALLOW_CORS_WILDCARD no puede habilitarse en producción.");
+}
 const corsOptions = {
   origin: function(origin, callback) {
     // Permitir wildcard en desarrollo si se activa la variable de entorno
@@ -93,9 +99,29 @@ const corsOptions = {
 // Habilitar CORS y lectura de cuerpos JSON
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:["'self'"], scriptSrc:["'self'"], styleSrc:["'self'","'unsafe-inline'"],
+      imgSrc:["'self'","data:","blob:"], fontSrc:["'self'","data:"],
+      connectSrc:["'self'",...allowedOrigins], objectSrc:["'none'"], baseUri:["'self'"],
+      frameAncestors:["'none'"], formAction:["'self'"]
+    }
+  },
+  crossOriginResourcePolicy:{ policy:"same-site" },
+  referrerPolicy:{ policy:"no-referrer" }
+}));
 app.use(cookieParser());
 app.use(express.json({ limit: "100kb" }));
+
+app.use((req,res,next) => {
+  if (["POST","PUT","PATCH"].includes(req.method) && req.path.startsWith("/api/") && !req.is("application/json")) {
+    return res.status(415).json({ error:"El contenido debe enviarse como JSON." });
+  }
+  const unsafeKey = (value,depth=0) => depth > 12 || (value && typeof value === "object" && Object.entries(value).some(([key,child]) => ["__proto__","prototype","constructor"].includes(key) || unsafeKey(child,depth+1)));
+  if (unsafeKey(req.body)) return res.status(400).json({ error:"La solicitud contiene una estructura no permitida." });
+  next();
+});
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -107,9 +133,11 @@ const apiLimiter = rateLimit({
 });
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: "draft-8", legacyHeaders: false, skipSuccessfulRequests: true, message: { error: "Se realizaron varios intentos incorrectos. Espera unos minutos antes de volver a ingresar." } });
 const aiLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: "draft-8", legacyHeaders: false, message: { error: "Se alcanzó el límite temporal de solicitudes de IA." } });
+const mutationLimiter = rateLimit({ windowMs:60 * 1000, limit:Number(process.env.MUTATION_RATE_LIMIT || 90), standardHeaders:"draft-8", legacyHeaders:false, message:{ error:"Se detectaron demasiados cambios en poco tiempo. Espera un momento." } });
 
 app.use("/api", apiLimiter);
 app.use(["/api/auth/login", "/api/auth/quick-login", "/api/auth/signup", "/api/auth/refresh"], authLimiter);
+app.use("/api", (req,res,next) => ["POST","PUT","PATCH","DELETE"].includes(req.method) && !req.path.startsWith("/auth/") ? mutationLimiter(req,res,next) : next());
 
 app.use((req, res, next) => {
   const sendJson = res.json.bind(res);
@@ -561,6 +589,9 @@ async function ensureLocalSeedUsers() {
 
 // Helper: Crear y guardar refresh token en BD (dev: 30 días)
 async function createRefreshToken(username, daysValid = 30) {
+  await pool.execute("DELETE FROM refresh_tokens WHERE expires_at < NOW()");
+  const [existing] = await pool.execute("SELECT token_hash FROM refresh_tokens WHERE username=? ORDER BY created_at DESC",[username]);
+  for (const row of existing.slice(4)) await pool.execute("DELETE FROM refresh_tokens WHERE token_hash=?",[row.token_hash]);
   const token = crypto.randomBytes(64).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   const expiresAt = new Date(Date.now() + daysValid * 24 * 60 * 60 * 1000);
@@ -632,7 +663,7 @@ async function requireAuth(req, res, next) {
 
   const token = authHeader.substring(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET, JWT_VERIFY_OPTIONS);
     const [users] = await pool.execute(
       "SELECT username, role, status FROM users WHERE username = ? LIMIT 1",
       [payload.username]
@@ -893,6 +924,7 @@ function requireModulePermission(req, res, next) {
 
 // Registro de Usuario Nuevo
 app.post("/api/auth/signup", async (req, res) => {
+  if (process.env.ENABLE_PUBLIC_SIGNUP !== "true" || IS_PRODUCTION) return res.status(404).json({ error:"Recurso no encontrado." });
   const { username, password } = req.body;
   if (typeof username !== "string" || !/^[a-zA-Z0-9._-]{3,50}$/.test(username.trim())) {
     return res.status(400).json({ error: "El usuario debe tener entre 3 y 50 caracteres válidos." });
@@ -924,7 +956,7 @@ app.post("/api/auth/signup", async (req, res) => {
     );
 
     // Generar JWT y refresh token
-    const accessToken = jwt.sign({ username: normalizedUser, role: defaultRole }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const accessToken = createAccessToken(normalizedUser,defaultRole);
     const refreshToken = await createRefreshToken(normalizedUser, 30);
     const cookieOptions = {
       httpOnly: true,
@@ -974,7 +1006,7 @@ app.post("/api/auth/quick-login", async (req, res) => {
       "SELECT COUNT(*) AS count FROM projects WHERE username = ?",
       [dbUser.username]
     );
-    const accessToken = jwt.sign({ username: dbUser.username, role: dbUser.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const accessToken = createAccessToken(dbUser.username,dbUser.role);
     const refreshToken = await createRefreshToken(dbUser.username, 30);
     res.cookie("refreshToken", refreshToken, {
       httpOnly: true,
@@ -1036,7 +1068,7 @@ app.post("/api/auth/login", async (req, res) => {
     );
     const projectsCount = projectCountRows[0].count;
 
-    const accessToken = jwt.sign({ username: dbUser.username, role: dbUser.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const accessToken = createAccessToken(dbUser.username,dbUser.role);
     const refreshToken = await createRefreshToken(dbUser.username, 30);
 
     // Set refresh token in HttpOnly cookie
@@ -1073,7 +1105,7 @@ app.get("/api/auth/me", async (req, res) => {
 
   const token = authHeader.substring(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET, JWT_VERIFY_OPTIONS);
     const username = payload.username;
 
     const [users] = await pool.execute(
@@ -1100,7 +1132,7 @@ app.get("/api/auth/me", async (req, res) => {
       }
     });
   } catch (err) {
-    res.json({ user: null, error: err.message });
+    res.json({ user: null });
   }
 });
 
@@ -1151,7 +1183,7 @@ app.post('/api/auth/refresh', async (req, res) => {
     };
     res.cookie('refreshToken', newRefreshToken, cookieOptions);
 
-    const accessToken = jwt.sign({ username: row.username, role: row.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const accessToken = createAccessToken(row.username,row.role);
     res.json({ sessionId: accessToken });
   } catch (err) {
     res.status(500).json({ error: 'Error procesando refresh token.', details: err.message });
@@ -1162,7 +1194,7 @@ app.post('/api/auth/refresh', async (req, res) => {
 app.post('/api/auth/logout', async (req, res) => {
   try {
     const cookieToken = req.cookies?.refreshToken;
-    if (!cookieToken) return res.status(400).json({ error: 'Refresh token cookie requerido.' });
+    if (!cookieToken) return res.json({ success:true });
     await revokeRefreshToken(cookieToken);
     res.clearCookie('refreshToken', { path: '/' });
     res.json({ success: true });
@@ -2145,7 +2177,7 @@ app.use((err, req, res, next) => {
 const distPath = process.env.FRONTEND_DIST_PATH
   ? path.resolve(process.env.FRONTEND_DIST_PATH)
   : path.join(__dirname, "../crm-front/dist");
-app.use(express.static(distPath));
+app.use(express.static(distPath,{ dotfiles:"deny",fallthrough:true,maxAge:IS_PRODUCTION ? "1h" : 0,index:false }));
 
 // Ruta comodín para SPA Fallback de React
 app.get("*", (req, res) => {
@@ -2153,7 +2185,7 @@ app.get("*", (req, res) => {
 });
 
 // Arrancar el Servidor
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`====================================================`);
   console.log(`🚀 DESIGNS CRM - SERVIDOR DE RESPALDO WAMP MYSQL`);
   console.log(`🖥️  Local: http://localhost:${PORT}`);
@@ -2161,3 +2193,7 @@ app.listen(PORT, "0.0.0.0", () => {
   setTimeout(() => void sendRenewalPushes(), 15_000);
   setInterval(() => void sendRenewalPushes(), 6 * 60 * 60 * 1000);
 });
+server.requestTimeout = 30_000;
+server.headersTimeout = 15_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 500;
