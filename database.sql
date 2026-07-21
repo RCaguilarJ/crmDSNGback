@@ -96,6 +96,15 @@ CREATE TABLE IF NOT EXISTS `record_access` (
   INDEX `idx_record_access_user` (`username`,`module_name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `role_permissions` (
+  `role_key` VARCHAR(40) NOT NULL,
+  `module_name` VARCHAR(50) NOT NULL,
+  `action_name` VARCHAR(20) NOT NULL,
+  `allowed` TINYINT(1) NOT NULL DEFAULT 0,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`role_key`,`module_name`,`action_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `shared_module_records` (
   `module_name` VARCHAR(50) NOT NULL,
   `record_id` VARCHAR(100) NOT NULL,

@@ -147,6 +147,7 @@ const pool = mysql.createPool({
     await ensurePushSchema();
     await ensureNotificationsSchema();
     await ensureRecordAccessSchema();
+    await ensureRolePermissionsSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
       await ensureLocalSeedUsers();
       console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
@@ -359,11 +360,68 @@ async function ensureRecordAccessSchema() {
   }
   await pool.query("INSERT IGNORE INTO record_access (module_name,record_id,username,is_owner) SELECT 'projects',id,username,1 FROM projects");
   await pool.query("INSERT IGNORE INTO record_access (module_name,record_id,username,is_owner) SELECT 'projects_web',id,username,1 FROM web_projects");
+  const [adminRows] = await pool.execute("SELECT username FROM users WHERE role='Admin General' AND status='Activo' ORDER BY username LIMIT 1");
+  const fallbackOwner = adminRows[0]?.username || "adriana";
+  const activitySources = [
+    { moduleName:"clients", table:"clients" },
+    { moduleName:"projects", table:"projects" },
+    { moduleName:"projects_web", table:"web_projects" },
+    { moduleName:"kanban", table:"kanban_cards" },
+    { moduleName:"tasks", table:"tasks" },
+    { moduleName:"billing", table:"invoices" }
+  ];
+  for (const source of activitySources) {
+    const [activityRows] = await pool.query(
+      `SELECT source.*,
+              EXISTS (
+                SELECT 1 FROM record_access existing
+                 WHERE existing.module_name=? AND existing.record_id=source.id
+              ) has_access
+         FROM \`${source.table}\` source
+        `,
+      [source.moduleName]
+    );
+    for (const row of activityRows) {
+      const assignmentSource = { ...row };
+      if (typeof assignmentSource.devs === "string") {
+        try { assignmentSource.devs = JSON.parse(assignmentSource.devs); } catch { /* conserva el valor original */ }
+      }
+      const assigned = await resolveAssignedUsers(assignmentSource);
+      const usernames = assigned.length ? assigned : (row.has_access ? [] : [fallbackOwner]);
+      for (const [index,username] of usernames.entries()) {
+        await pool.execute(
+          "INSERT IGNORE INTO record_access (module_name,record_id,username,is_owner) VALUES (?,?,?,?)",
+          [source.moduleName,String(row.id),username,!row.has_access && index === 0 ? 1 : 0]
+        );
+      }
+    }
+  }
   const physicalTables = {clients:"clients",projects:"projects",projects_web:"web_projects",kanban:"kanban_cards",tasks:"tasks",billing:"invoices"};
   for (const [moduleName,table] of Object.entries(physicalTables)) {
     await pool.query(`DELETE ra FROM record_access ra LEFT JOIN \`${table}\` source ON source.id=ra.record_id WHERE ra.module_name=? AND source.id IS NULL`,[moduleName]);
   }
   await pool.query("DELETE ra FROM record_access ra LEFT JOIN shared_module_records source ON source.module_name=ra.module_name AND source.record_id=ra.record_id WHERE ra.module_name IN ('leads','services','renewals','quotes','staff','credentials') AND source.record_id IS NULL");
+}
+
+const PERMISSION_ACTIONS = ["view","create","edit","delete","export"];
+
+async function ensureRolePermissionsSchema() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS role_permissions (
+    role_key VARCHAR(40) NOT NULL,
+    module_name VARCHAR(50) NOT NULL,
+    action_name VARCHAR(20) NOT NULL,
+    allowed TINYINT(1) NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (role_key,module_name,action_name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  for (const [moduleName,roles] of Object.entries(PERMISSIONS)) {
+    for (const roleKey of Object.values(ROLE_KEY_BY_NAME).filter((value,index,array) => array.indexOf(value) === index)) {
+      for (const action of PERMISSION_ACTIONS) {
+        const allowed = roleKey === "admin_general" || (roles.includes(roleKey) && action !== "delete");
+        await pool.execute("INSERT IGNORE INTO role_permissions (role_key,module_name,action_name,allowed) VALUES (?,?,?,?)",[roleKey,moduleName,action,allowed ? 1 : 0]);
+      }
+    }
+  }
 }
 
 function pushSubscriptionId(endpoint) {
@@ -600,7 +658,7 @@ const PERMISSIONS = {
   services: ["admin_general", "administracion"],
   billing: ["admin_general", "administracion"],
   renewals: ["admin_general", "administracion"],
-  quotes: ["admin_general", "administracion", "gerente_dev", "gerente_web"],
+  quotes: ["admin_general", "administracion"],
   projects: ["admin_general", "administracion", "gerente_dev"],
   projects_web: ["admin_general", "gerente_web"],
   kanban: ["admin_general", "administracion", "gerente_dev", "gerente_web"],
@@ -611,6 +669,21 @@ const PERMISSIONS = {
   users: ["admin_general"],
   settings: ["admin_general"]
 };
+
+const LOCKED_ROLE_MODULES = new Set(["quotes"]);
+
+function requestPermissionAction(req) {
+  if (req.method === "GET" || req.method === "HEAD") return "view";
+  if (req.method === "POST") return "create";
+  if (req.method === "DELETE") return "delete";
+  return "edit";
+}
+
+async function hasRolePermission(roleKey, moduleName, actionName) {
+  if (roleKey === "admin_general") return true;
+  const [rows] = await pool.execute("SELECT allowed FROM role_permissions WHERE role_key=? AND module_name=? AND action_name=? LIMIT 1",[roleKey,moduleName,actionName]);
+  return Boolean(rows[0]?.allowed);
+}
 
 const NOTIFICATION_MODULES = {
   clients: { permission:"clients", view:"clients", singular:"cliente" },
@@ -677,9 +750,19 @@ function accessSql(moduleName, idExpression = "id") {
   return `(NOT EXISTS (SELECT 1 FROM record_access ra0 WHERE ra0.module_name='${moduleName}' AND ra0.record_id=${idExpression}) OR EXISTS (SELECT 1 FROM record_access ra WHERE ra.module_name='${moduleName}' AND ra.record_id=${idExpression} AND ra.username=?))`;
 }
 
+function strictAccessSql(moduleName, idExpression = "id") {
+  return `EXISTS (SELECT 1 FROM record_access ra WHERE ra.module_name='${moduleName}' AND ra.record_id=${idExpression} AND ra.username=?)`;
+}
+
+const STRICT_ACTIVITY_MODULES = new Set(["clients","projects","projects_web","kanban","tasks","billing"]);
+
 async function userCanAccessRecord(req, moduleName, recordId) {
   if (req.role === "Admin General") return true;
-  const [rows] = await pool.execute(`SELECT ${accessSql(moduleName, "?")} allowed`, [String(recordId),String(recordId),req.username]);
+  const clause = STRICT_ACTIVITY_MODULES.has(moduleName) ? strictAccessSql(moduleName,"?") : accessSql(moduleName,"?");
+  const params = STRICT_ACTIVITY_MODULES.has(moduleName)
+    ? [String(recordId),req.username]
+    : [String(recordId),String(recordId),req.username];
+  const [rows] = await pool.execute(`SELECT ${clause} allowed`, params);
   return Boolean(rows[0]?.allowed);
 }
 
@@ -718,7 +801,8 @@ async function createPlatformNotification(req) {
   if (req.skipAudit) return;
   const context = notificationContext(req);
   if (!context || !req.username) return;
-  const allowedRoles = PERMISSIONS[context.permission] || [];
+  const [permissionRows] = await pool.execute("SELECT role_key FROM role_permissions WHERE module_name=? AND action_name='view' AND allowed=1",[context.permission]);
+  const allowedRoles = permissionRows.map((row) => row.role_key);
   if (!allowedRoles.length) return;
   const [actorRows] = await pool.execute("SELECT name FROM users WHERE username=? LIMIT 1", [req.username]);
   const actorName = actorRows[0]?.name || req.username;
@@ -731,6 +815,7 @@ async function createPlatformNotification(req) {
   const recipients = users.filter((user) => {
     if (user.role === "Admin General") return true;
     const roleAllowed = allowedRoles.includes(ROLE_KEY_BY_NAME[user.role]);
+    if (LOCKED_ROLE_MODULES.has(context.permission)) return roleAllowed;
     return accessRows.length ? accessibleUsers.has(user.username) : roleAllowed;
   });
   if (!recipients.length) return;
@@ -773,13 +858,16 @@ app.use((req, res, next) => {
   next();
 });
 
-function requirePermission(permission) {
+function requirePermission(permission, explicitAction = null) {
   return async (req, res, next) => {
     const roleKey = ROLE_KEY_BY_NAME[req.role];
-    if (roleKey && PERMISSIONS[permission]?.includes(roleKey)) return next();
+    const action = explicitAction || requestPermissionAction(req);
+    if (roleKey && await hasRolePermission(roleKey,permission,action)) return next();
     try {
-      const [assigned] = await pool.execute("SELECT 1 FROM record_access WHERE module_name=? AND username=? LIMIT 1",[permission,req.username]);
-      if (assigned.length) return next();
+      if (!LOCKED_ROLE_MODULES.has(permission) && ["view","edit"].includes(action)) {
+        const [assigned] = await pool.execute("SELECT 1 FROM record_access WHERE module_name=? AND username=? LIMIT 1",[permission,req.username]);
+        if (assigned.length) return next();
+      }
       return res.status(403).json({ error: "No tienes permiso para acceder a este recurso." });
     } catch (error) {
       return res.status(500).json({ error:"No se pudo validar el acceso.",details:error.message });
@@ -789,7 +877,7 @@ function requirePermission(permission) {
 
 function requireModulePermission(req, res, next) {
   if (!PERMISSIONS[req.params.module]) return next();
-  return requirePermission(req.params.module)(req, res, next);
+  return requirePermission(req.params.module,req.method === "PUT" ? "view" : null)(req, res, next);
 }
 
 // ====================================================================
@@ -1079,9 +1167,53 @@ app.post('/api/auth/logout', async (req, res) => {
 app.get("/api/access/modules", requireAuth, async (req,res) => {
   try {
     const [rows] = await pool.execute("SELECT DISTINCT module_name FROM record_access WHERE username=?",[req.username]);
-    res.json({ modules:rows.map((row) => row.module_name) });
+    const roleKey = ROLE_KEY_BY_NAME[req.role];
+    const modules = [];
+    for (const row of rows) {
+      if (!LOCKED_ROLE_MODULES.has(row.module_name) || await hasRolePermission(roleKey,row.module_name,"view")) modules.push(row.module_name);
+    }
+    res.json({ modules });
   } catch (err) {
     res.status(500).json({ error:"No se pudieron cargar los accesos asignados.",details:err.message });
+  }
+});
+
+app.get("/api/permissions/effective", requireAuth, async (req,res) => {
+  try {
+    const roleKey = ROLE_KEY_BY_NAME[req.role];
+    const [rows] = await pool.execute("SELECT module_name AS moduleName,action_name AS actionName FROM role_permissions WHERE role_key=? AND allowed=1",[roleKey]);
+    const permissions = {};
+    for (const row of rows) (permissions[row.moduleName] ||= []).push(row.actionName);
+    res.json({ permissions });
+  } catch (err) {
+    res.status(500).json({ error:"No se pudieron cargar los permisos.",details:err.message });
+  }
+});
+
+app.get("/api/permissions", requireAuth, async (req,res) => {
+  if (req.role !== "Admin General") return res.status(403).json({error:"Solo Admin General puede administrar permisos."});
+  try {
+    const [rows] = await pool.execute("SELECT role_key AS roleKey,module_name AS moduleName,action_name AS actionName,allowed FROM role_permissions ORDER BY role_key,module_name,action_name");
+    res.json({ permissions:rows });
+  } catch (err) {
+    res.status(500).json({ error:"No se pudieron cargar los permisos.",details:err.message });
+  }
+});
+
+app.put("/api/permissions", requireAuth, async (req,res) => {
+  if (req.role !== "Admin General") return res.status(403).json({error:"Solo Admin General puede administrar permisos."});
+  const entries = Array.isArray(req.body.permissions) ? req.body.permissions : [];
+  const validRoles = new Set(["admin_general","administracion","gerente_dev","gerente_web"]);
+  const validModules = new Set(Object.keys(PERMISSIONS));
+  try {
+    for (const entry of entries) {
+      if (!validRoles.has(entry.roleKey) || !validModules.has(entry.moduleName) || !PERMISSION_ACTIONS.includes(entry.actionName)) continue;
+      const allowed = entry.roleKey === "admin_general" || (entry.actionName === "delete" ? false : Boolean(entry.allowed));
+      await pool.execute("INSERT INTO role_permissions (role_key,module_name,action_name,allowed) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE allowed=VALUES(allowed)",[entry.roleKey,entry.moduleName,entry.actionName,allowed ? 1 : 0]);
+    }
+    res.json({success:true});
+  } catch (err) {
+    res.status(500).json({error:"No se pudieron guardar los permisos.",details:err.message});
   }
 });
 
@@ -1231,7 +1363,7 @@ const DEFAULT_SETTINGS = {companyName:"Designs Agency S.A. de C.V.",rfc:"DAG2401
 app.get("/api/settings", requireAuth, async (_req,res)=>{try{const [rows]=await pool.execute("SELECT data FROM settings WHERE id=1");const data=rows.length?rows[0].data:null;res.json({settings:data?(typeof data==="string"?JSON.parse(data):data):DEFAULT_SETTINGS});}catch(err){res.status(500).json({error:"No se pudo cargar la configuración.",details:err.message});}});
 app.put("/api/settings", requireAuth, async (req,res)=>{if(req.role!=="Admin General")return res.status(403).json({error:"Solo Admin General puede modificar la configuración."});const settings={...DEFAULT_SETTINGS,...req.body,sessionTimeout:Math.max(5,Math.min(60,Number(req.body.sessionTimeout)||10))};try{await pool.execute("INSERT INTO settings (id,data) VALUES (1,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",[JSON.stringify(settings)]);res.json({success:true,settings});}catch(err){res.status(500).json({error:"No se pudo guardar la configuración.",details:err.message});}});
 
-app.get("/api/kanban", requireAuth, async (req,res)=>{try{const params=[];const where=req.role==="Admin General"?"":`WHERE ${accessSql("kanban")}`;if(where)params.push(req.username);const [rows]=await pool.execute(`SELECT id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date AS dueDate FROM kanban_cards ${where} ORDER BY created_at`,params);res.json({cards:rows.map(r=>({...r,tags:typeof r.tags==='string'?JSON.parse(r.tags):r.tags}))});}catch(err){res.status(500).json({error:"No se pudo cargar el tablero.",details:err.message});}});
+app.get("/api/kanban", requireAuth, async (req,res)=>{try{const params=[];const where=req.role==="Admin General"?"":`WHERE ${strictAccessSql("kanban")}`;if(where)params.push(req.username);const [rows]=await pool.execute(`SELECT id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date AS dueDate FROM kanban_cards ${where} ORDER BY created_at`,params);res.json({cards:rows.map(r=>({...r,tags:typeof r.tags==='string'?JSON.parse(r.tags):r.tags}))});}catch(err){res.status(500).json({error:"No se pudo cargar el tablero.",details:err.message});}});
 app.post("/api/kanban", requireAuth, async (req,res)=>{const {board,stage,title,subtitle,priority,tags,progress,assignee,dueDate}=req.body;if(!board||!stage||!title)return res.status(400).json({error:"Tablero, etapa y título son obligatorios."});const id=`kan_${Date.now()}`;try{await pool.execute("INSERT INTO kanban_cards (id,board,stage,title,subtitle,priority,tags,progress,assignee,due_date) VALUES (?,?,?,?,?,?,?,?,?,?)",[id,board,stage,title,subtitle||'',priority||'Media',JSON.stringify(Array.isArray(tags)?tags:[]),progress??null,assignee||'D',dueDate||'']);await syncRecordAccess("kanban",id,req.username,req.body,false);req.auditRecordId=id;res.status(201).json({success:true,id});}catch(err){res.status(500).json({error:"No se pudo crear la tarjeta.",details:err.message});}});
 app.put("/api/kanban/:id", requireAuth, async (req,res)=>{const allowed=['board','stage','title','subtitle','priority','progress','assignee'],sets=[],values=[];for(const key of allowed)if(req.body[key]!==undefined){sets.push(`\`${key}\`=?`);values.push(req.body[key]);}if(req.body.tags!==undefined){sets.push('tags=?');values.push(JSON.stringify(req.body.tags));}if(req.body.dueDate!==undefined){sets.push('due_date=?');values.push(req.body.dueDate);}if(!sets.length)return res.status(400).json({error:'No hay cambios.'});if(!await userCanAccessRecord(req,"kanban",req.params.id))return res.status(403).json({error:"No tienes acceso a esta tarjeta."});values.push(req.params.id);try{await pool.execute(`UPDATE kanban_cards SET ${sets.join(',')} WHERE id=?`,values);await syncRecordAccess("kanban",req.params.id,req.username,req.body);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo mover o actualizar la tarjeta.",details:err.message});}});
 app.delete("/api/kanban/:id", requireAuth, async (req,res)=>{try{await pool.execute("DELETE FROM kanban_cards WHERE id=?",[req.params.id]);res.json({success:true});}catch(err){res.status(500).json({error:"No se pudo eliminar la tarjeta.",details:err.message});}});
@@ -1256,7 +1388,7 @@ app.get("/api/clients", requireAuth, async (req, res) => {
         avatar_bg AS avatarBg,
         created_at AS createdAt
       FROM clients
-      ${req.role === "Admin General" ? "" : `WHERE ${accessSql("clients")}`}
+      ${req.role === "Admin General" ? "" : `WHERE ${strictAccessSql("clients")}`}
       ORDER BY created_at DESC`
       , req.role === "Admin General" ? [] : [req.username]
     );
@@ -1399,7 +1531,7 @@ app.delete("/api/clients/:id", requireAuth, async (req, res) => {
 // Obtener Proyectos del Usuario Conectado
 app.get("/api/projects", requireAuth, async (req, res) => {
   try {
-    const where = req.role === "Admin General" ? "" : `WHERE ${accessSql("projects")}`;
+    const where = req.role === "Admin General" ? "" : `WHERE ${strictAccessSql("projects")}`;
     const [rows] = await pool.execute(
       `SELECT id,name,client_name AS clientName,description,figma_node AS figmaNode,tailwind_classes AS tailwindClasses,component_code AS componentCode,status,due_date AS dueDate,budget,manager,devs,start_date AS startDate,progress,priority,created_at AS createdAt FROM projects ${where} ORDER BY created_at DESC`,
       req.role === "Admin General" ? [] : [req.username]
@@ -1572,7 +1704,7 @@ app.delete("/api/projects/:id", requireAuth, async (req, res) => {
 // ====================================================================
 app.get("/api/web-projects", requireAuth, async (req, res) => {
   try {
-    const where = req.role === "Admin General" ? "" : `WHERE ${accessSql("projects_web")}`;
+    const where = req.role === "Admin General" ? "" : `WHERE ${strictAccessSql("projects_web")}`;
     const [rows] = await pool.execute(
       `SELECT id, name, client_name AS clientName, manager, designer, builder, start_date AS startDate, due_date AS dueDate, progress, status, priority, description, created_at AS createdAt, updated_at AS updatedAt FROM web_projects ${where} ORDER BY created_at DESC`,
       req.role === "Admin General" ? [] : [req.username]
@@ -1694,7 +1826,7 @@ app.get("/api/tasks", requireAuth, async (req, res) => {
         assignee,
         created_at AS createdAt
       FROM tasks
-      ${req.role === "Admin General" ? "" : `WHERE ${accessSql("tasks")}`}
+      ${req.role === "Admin General" ? "" : `WHERE ${strictAccessSql("tasks")}`}
       ORDER BY created_at DESC`
       , req.role === "Admin General" ? [] : [req.username]
     );
@@ -1795,7 +1927,7 @@ app.get("/api/invoices", requireAuth, async (req, res) => {
         description,
         created_at AS createdAt
       FROM invoices
-      ${req.role === "Admin General" ? "" : `WHERE ${accessSql("billing")}`}
+      ${req.role === "Admin General" ? "" : `WHERE ${strictAccessSql("billing")}`}
       ORDER BY created_at DESC`
       , req.role === "Admin General" ? [] : [req.username]
     );
@@ -1858,6 +1990,10 @@ app.put("/api/module-data/:module", requireAuth, async (req,res) => {
       const oldItem = previousById.get(String(item?.id));
       return oldItem && JSON.stringify(oldItem) !== JSON.stringify(item);
     });
+    const roleKey = ROLE_KEY_BY_NAME[req.role];
+    if (added.length && !await hasRolePermission(roleKey,req.params.module,"create")) return res.status(403).json({error:"No tienes permiso para crear registros en este módulo."});
+    if (changed.length && !await hasRolePermission(roleKey,req.params.module,"edit")) return res.status(403).json({error:"No tienes permiso para editar registros en este módulo."});
+    if (removed.length && !await hasRolePermission(roleKey,req.params.module,"delete")) return res.status(403).json({error:"No tienes permiso para eliminar registros en este módulo."});
     if (removed.length && req.role !== "Admin General") return res.status(403).json({error:"Solo Admin General puede eliminar registros."});
     for (const item of nextData) {
       const id = String(item.id);
@@ -1888,8 +2024,8 @@ app.put("/api/module-data/:module", requireAuth, async (req,res) => {
 
 app.get("/api/reports/summary", requireAuth, async (req, res) => {
   try {
-    const invoiceAccess = req.role === "Admin General" ? "" : `AND ${accessSql("billing","i.id")}`;
-    const projectAccess = req.role === "Admin General" ? "" : `WHERE ${accessSql("projects","p.id")}`;
+    const invoiceAccess = req.role === "Admin General" ? "" : `AND ${strictAccessSql("billing","i.id")}`;
+    const projectAccess = req.role === "Admin General" ? "" : `WHERE ${strictAccessSql("projects","p.id")}`;
     const invoiceParams = req.role === "Admin General" ? [] : [req.username];
     const projectParams = req.role === "Admin General" ? [] : [req.username];
     const [[invoiceTotals], [activeProjects], [monthlyRows], [managerRows]] = await Promise.all([
