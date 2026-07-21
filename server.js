@@ -97,8 +97,15 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { poli
 app.use(cookieParser());
 app.use(express.json({ limit: "100kb" }));
 
-const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false, message: { error: "Demasiadas solicitudes. Intenta nuevamente más tarde." } });
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: "draft-8", legacyHeaders: false, skipSuccessfulRequests: true, message: { error: "Demasiados intentos de autenticación. Intenta nuevamente en 15 minutos." } });
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 1200,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  skip: (req) => req.path.startsWith("/auth/"),
+  message: { error: "El servicio está recibiendo muchas solicitudes. Espera un momento e intenta nuevamente." }
+});
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: "draft-8", legacyHeaders: false, skipSuccessfulRequests: true, message: { error: "Se realizaron varios intentos incorrectos. Espera unos minutos antes de volver a ingresar." } });
 const aiLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: "draft-8", legacyHeaders: false, message: { error: "Se alcanzó el límite temporal de solicitudes de IA." } });
 
 app.use("/api", apiLimiter);
