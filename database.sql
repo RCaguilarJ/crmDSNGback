@@ -105,6 +105,15 @@ CREATE TABLE IF NOT EXISTS `role_permissions` (
   PRIMARY KEY (`role_key`,`module_name`,`action_name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `user_module_permissions` (
+  `username` VARCHAR(50) NOT NULL,
+  `module_name` VARCHAR(50) NOT NULL,
+  `allowed` TINYINT(1) NOT NULL DEFAULT 1,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`username`,`module_name`),
+  CONSTRAINT `fk_user_module_permissions_user` FOREIGN KEY (`username`) REFERENCES `users` (`username`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `shared_module_records` (
   `module_name` VARCHAR(50) NOT NULL,
   `record_id` VARCHAR(100) NOT NULL,

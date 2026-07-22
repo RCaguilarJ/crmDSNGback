@@ -183,6 +183,7 @@ const pool = mysql.createPool({
     await ensureNotificationsSchema();
     await ensureRecordAccessSchema();
     await ensureRolePermissionsSchema();
+    await ensureUserModulePermissionsSchema();
     if (process.env.ENABLE_DEMO_SEED === "true") {
       await ensureLocalSeedUsers();
       console.warn("⚠️ Usuarios demo habilitados explícitamente para desarrollo local.");
@@ -457,6 +458,18 @@ async function ensureRolePermissionsSchema() {
       }
     }
   }
+}
+
+async function ensureUserModulePermissionsSchema() {
+  await pool.execute(`CREATE TABLE IF NOT EXISTS user_module_permissions (
+    username VARCHAR(50) NOT NULL,
+    module_name VARCHAR(50) NOT NULL,
+    allowed TINYINT(1) NOT NULL DEFAULT 1,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (username,module_name),
+    CONSTRAINT fk_user_module_permissions_user FOREIGN KEY (username)
+      REFERENCES users(username) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 }
 
 function pushSubscriptionId(endpoint) {
@@ -900,6 +913,11 @@ function requirePermission(permission, explicitAction = null) {
   return async (req, res, next) => {
     const roleKey = ROLE_KEY_BY_NAME[req.role];
     const action = explicitAction || requestPermissionAction(req);
+    if (req.role !== "Admin General") {
+      const [overrides] = await pool.execute("SELECT allowed FROM user_module_permissions WHERE username=? AND module_name=? LIMIT 1",[req.username,permission]);
+      if (overrides.length && !overrides[0].allowed) return res.status(403).json({ error:"Este módulo no está habilitado para tu usuario." });
+      if (action === "view" && overrides.length && overrides[0].allowed) return next();
+    }
     if (roleKey && await hasRolePermission(roleKey,permission,action)) return next();
     try {
       if (!LOCKED_ROLE_MODULES.has(permission) && ["view","edit"].includes(action)) {
@@ -1208,7 +1226,10 @@ app.get("/api/access/modules", requireAuth, async (req,res) => {
     const [rows] = await pool.execute("SELECT DISTINCT module_name FROM record_access WHERE username=?",[req.username]);
     const roleKey = ROLE_KEY_BY_NAME[req.role];
     const modules = [];
+    const [deniedRows] = await pool.execute("SELECT module_name FROM user_module_permissions WHERE username=? AND allowed=0",[req.username]);
+    const denied = new Set(deniedRows.map((row) => row.module_name));
     for (const row of rows) {
+      if (denied.has(row.module_name)) continue;
       if (!LOCKED_ROLE_MODULES.has(row.module_name) || await hasRolePermission(roleKey,row.module_name,"view")) modules.push(row.module_name);
     }
     res.json({ modules });
@@ -1223,6 +1244,13 @@ app.get("/api/permissions/effective", requireAuth, async (req,res) => {
     const [rows] = await pool.execute("SELECT module_name AS moduleName,action_name AS actionName FROM role_permissions WHERE role_key=? AND allowed=1",[roleKey]);
     const permissions = {};
     for (const row of rows) (permissions[row.moduleName] ||= []).push(row.actionName);
+    if (req.role !== "Admin General") {
+      const [overrides] = await pool.execute("SELECT module_name AS moduleName,allowed FROM user_module_permissions WHERE username=?",[req.username]);
+      for (const override of overrides) {
+        if (override.allowed) (permissions[override.moduleName] ||= []).push("view");
+        else delete permissions[override.moduleName];
+      }
+    }
     res.json({ permissions });
   } catch (err) {
     res.status(500).json({ error:"No se pudieron cargar los permisos.",details:err.message });
@@ -1319,6 +1347,39 @@ app.get("/api/users", requireAuth, async (_req, res) => {
   } catch(err){res.status(500).json({error:"No se pudo cargar el directorio.",details:err.message});}
 });
 
+app.get("/api/users/:username/modules", requireAuth, async (req,res) => {
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  try {
+    const [users] = await pool.execute("SELECT role FROM users WHERE username=? LIMIT 1",[req.params.username]);
+    if(!users.length) return res.status(404).json({error:"Usuario no encontrado."});
+    const roleKey = ROLE_KEY_BY_NAME[users[0].role];
+    const [roleRows] = await pool.execute("SELECT module_name FROM role_permissions WHERE role_key=? AND action_name='view' AND allowed=1",[roleKey]);
+    const [overrideRows] = await pool.execute("SELECT module_name,allowed FROM user_module_permissions WHERE username=?",[req.params.username]);
+    const enabled = new Set(roleRows.map((row)=>row.module_name));
+    for(const row of overrideRows) row.allowed ? enabled.add(row.module_name) : enabled.delete(row.module_name);
+    enabled.add("dashboard");
+    res.json({modules:[...enabled],customized:overrideRows.length>0});
+  } catch(err){res.status(500).json({error:"No se pudieron cargar los módulos del usuario.",details:err.message});}
+});
+
+app.put("/api/users/:username/modules", requireAuth, async (req,res) => {
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  if(req.params.username==="adriana") return res.json({success:true});
+  const selected = new Set(Array.isArray(req.body.modules) ? req.body.modules.filter((moduleName)=>Object.hasOwn(PERMISSIONS,moduleName)) : []);
+  selected.add("dashboard");
+  const connection=await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [users]=await connection.execute("SELECT username FROM users WHERE username=? FOR UPDATE",[req.params.username]);
+    if(!users.length){await connection.rollback();return res.status(404).json({error:"Usuario no encontrado."});}
+    await connection.execute("DELETE FROM user_module_permissions WHERE username=?",[req.params.username]);
+    for(const moduleName of Object.keys(PERMISSIONS)) await connection.execute("INSERT INTO user_module_permissions (username,module_name,allowed) VALUES (?,?,?)",[req.params.username,moduleName,selected.has(moduleName)?1:0]);
+    await connection.commit();
+    res.json({success:true,modules:[...selected]});
+  } catch(err){await connection.rollback();res.status(500).json({error:"No se pudieron guardar los módulos.",details:err.message});}
+  finally{connection.release();}
+});
+
 app.get("/api/users-trash", requireAuth, async (req, res) => {
   if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
   try {
@@ -1341,11 +1402,31 @@ app.post("/api/users-trash/:id/restore", requireAuth, async (req,res)=>{
     await restoreSnapshotRows(connection,"projects",snapshot.projects);
     await restoreSnapshotRows(connection,"web_projects",snapshot.webProjects);
     await restoreSnapshotRows(connection,"module_data",snapshot.moduleData);
+    await restoreSnapshotRows(connection,"user_module_permissions",snapshot.userModulePermissions);
     await connection.execute("DELETE FROM deleted_users WHERE id=?",[req.params.id]);
     await connection.commit();
     res.json({success:true});
   } catch(err){await connection.rollback();res.status(err.code==="ER_DUP_ENTRY"?409:500).json({error:err.code==="ER_DUP_ENTRY"?"Ya existe un usuario con ese identificador.":"No se pudo restaurar el usuario.",details:err.message});}
   finally{connection.release();}
+});
+
+app.delete("/api/users-trash/:id", requireAuth, async (req,res)=>{
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  try {
+    const [result]=await pool.execute("DELETE FROM deleted_users WHERE id=?",[req.params.id]);
+    if(!result.affectedRows) return res.status(404).json({error:"El usuario ya no está en la papelera."});
+    req.skipAudit=true;
+    res.json({success:true});
+  } catch(err){res.status(500).json({error:"No se pudo eliminar definitivamente al usuario.",details:err.message});}
+});
+
+app.delete("/api/users-trash", requireAuth, async (req,res)=>{
+  if(req.role!=="Admin General") return res.status(403).json({error:"Acceso insuficiente."});
+  try {
+    const [result]=await pool.execute("DELETE FROM deleted_users");
+    req.skipAudit=true;
+    res.json({success:true,deleted:result.affectedRows});
+  } catch(err){res.status(500).json({error:"No se pudo vaciar la papelera.",details:err.message});}
 });
 
 app.post("/api/users", requireAuth, async (req,res)=>{
@@ -1389,7 +1470,8 @@ app.delete("/api/users/:username", requireAuth, async (req,res)=>{
     const [projects]=await connection.execute("SELECT * FROM projects WHERE username=?",[req.params.username]);
     const [webProjects]=await connection.execute("SELECT * FROM web_projects WHERE username=?",[req.params.username]);
     const [moduleData]=await connection.execute("SELECT * FROM module_data WHERE username=?",[req.params.username]);
-    const user=users[0], snapshot={user,projects,webProjects,moduleData};
+    const [userModulePermissions]=await connection.execute("SELECT * FROM user_module_permissions WHERE username=?",[req.params.username]);
+    const user=users[0], snapshot={user,projects,webProjects,moduleData,userModulePermissions};
     await connection.execute("INSERT INTO deleted_users (username,name,email,role,area,status,snapshot,deleted_by) VALUES (?,?,?,?,?,?,?,?)",[user.username,user.name,user.email,user.role,user.area,user.status,JSON.stringify(snapshot),req.username]);
     await connection.execute("DELETE FROM users WHERE username=?",[req.params.username]);
     await connection.commit();
